@@ -1,0 +1,465 @@
+/*
+Copyright 2024 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package monitoring
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go.opencensus.io/stats"
+	"go.opencensus.io/stats/view"
+	"go.opencensus.io/tag"
+
+	"github.com/dapr/dapr/pkg/diagnostics/utils"
+	schedulerv1pb "github.com/dapr/dapr/pkg/proto/scheduler/v1"
+)
+
+var (
+	sidecarConnectionCount int64 = 0
+
+	sidecarsConnectedGauge = stats.Int64(
+		"scheduler/sidecars_connected",
+		"The number of dapr sidecars actively connected to the scheduler service.",
+		stats.UnitDimensionless)
+	jobsScheduledTotal = stats.Int64(
+		"scheduler/jobs_created_total",
+		"The total number of jobs scheduled.",
+		stats.UnitDimensionless)
+	jobsTriggeredTotal = stats.Int64(
+		"scheduler/jobs_triggered_total",
+		"The total number of successfully triggered jobs.",
+		stats.UnitDimensionless)
+	jobsFailedTotal = stats.Int64(
+		"scheduler/jobs_failed_total",
+		"The total number of failed jobs.",
+		stats.UnitDimensionless)
+	jobsUndeliveredTotal = stats.Int64(
+		"scheduler/jobs_undelivered_total",
+		"The total number of undelivered jobs.",
+		stats.UnitDimensionless)
+	triggerLatency = stats.Float64(
+		"scheduler/trigger_latency",
+		"The total time it takes to trigger a job from the scheduler service.",
+		stats.UnitMilliseconds)
+	concurrencyInflightGauge = stats.Int64(
+		"scheduler/concurrency_inflight",
+		"Current number of in-flight triggers subject to global concurrency limits on this scheduler instance.",
+		stats.UnitDimensionless)
+	concurrencyPendingGauge = stats.Int64(
+		"scheduler/concurrency_pending",
+		"Current number of triggers waiting for a concurrency slot on this scheduler instance.",
+		stats.UnitDimensionless)
+	concurrencyThrottledTotal = stats.Int64(
+		"scheduler/concurrency_throttled_total",
+		"Total number of triggers that were throttled by global concurrency limits.",
+		stats.UnitDimensionless)
+	workflowActivityBacklogGauge = stats.Int64(
+		"scheduler/workflow_activity_backlog",
+		"Current number of pull-dispatched workflow activities waiting for a free sidecar slot on this scheduler instance, by namespace, app_id and activity_name.",
+		stats.UnitDimensionless)
+	workflowActivityInflightGauge = stats.Int64(
+		"scheduler/workflow_activity_inflight",
+		"Current number of pull-dispatched workflow activities this scheduler instance handed to a sidecar and that have not finished, by namespace, app_id and activity_name.",
+		stats.UnitDimensionless)
+	workflowActivityRefusedTotal = stats.Int64(
+		"scheduler/workflow_activity_refused_total",
+		"Total number of pull-dispatched workflow activities a sidecar refused with NO_CAPACITY, by namespace, app_id and activity_name.",
+		stats.UnitDimensionless)
+	jobsDeletedTotal = stats.Int64(
+		"scheduler/jobs_deleted_total",
+		"The total number of deleted jobs.",
+		stats.UnitDimensionless)
+	jobsBulkDeletedTotal = stats.Int64(
+		"scheduler/jobs_bulk_deleted_total",
+		"The total number of bulk job deletion operations.",
+		stats.UnitDimensionless)
+	jobsCreatedFailedTotal = stats.Int64(
+		"scheduler/jobs_created_failed_total",
+		"The total number of failed job creation attempts.",
+		stats.UnitDimensionless)
+	sidecarErrorsTotal = stats.Int64(
+		"scheduler/sidecar_errors_total",
+		"The total number of sidecar communication and authorization errors.",
+		stats.UnitDimensionless)
+	placementLeaderGauge = stats.Int64(
+		"scheduler/placement_leader",
+		"Whether this scheduler is the current actor placement leader (1) or not (0).",
+		stats.UnitDimensionless)
+	placementStreamsGauge = stats.Int64(
+		"scheduler/placement_streams_connected",
+		"The number of daprd placement streams connected to this scheduler, by namespace.",
+		stats.UnitDimensionless)
+	placementDisseminationsTotal = stats.Int64(
+		"scheduler/placement_disseminations_total",
+		"The total number of placement dissemination rounds started, by namespace.",
+		stats.UnitDimensionless)
+	placementDisseminationLatency = stats.Float64(
+		"scheduler/placement_dissemination_latency",
+		"The time from a placement dissemination round starting to it completing, by namespace.",
+		stats.UnitMilliseconds)
+	placementTableUpdatesTotal = stats.Int64(
+		"scheduler/placement_table_updates_total",
+		"The total number of per actor type placement table rebuilds disseminated, by namespace and actor type.",
+		stats.UnitDimensionless)
+	placementIncapableSidecarsGauge = stats.Int64(
+		"scheduler/placement_incapable_sidecars",
+		"The number of connected sidecars running a Dapr version which cannot use scheduler placement. Non-zero after cutover means those sidecars' actors may be placed by a still-running placement service: alert on it.",
+		stats.UnitDimensionless)
+
+	tagType           = tag.MustNewKey("type")
+	tagConcurrencyKey = tag.MustNewKey("concurrency_key")
+	tagReason         = tag.MustNewKey("reason")
+	tagNamespace      = tag.MustNewKey("namespace")
+	tagActorType      = tag.MustNewKey("actor_type")
+	tagAppID          = tag.MustNewKey("app_id")
+	tagActivityName   = tag.MustNewKey("activity_name")
+)
+
+var (
+	tagPlacementLeader = utils.WithTags(placementLeaderGauge.Name())
+
+	// placementStreamCounts tracks the current stream count per namespace so
+	// the gauge can be recorded as an absolute value.
+	placementStreamsLock   sync.Mutex
+	placementStreamsCounts = make(map[string]int64)
+)
+
+// RecordPlacementLeaderStatus records whether this scheduler is the current
+// placement leader.
+func RecordPlacementLeaderStatus(leader bool) {
+	var v int64
+	if leader {
+		v = 1
+	}
+	stats.RecordWithTags(context.Background(), tagPlacementLeader, placementLeaderGauge.M(v))
+}
+
+// RecordPlacementStreamsConnected records a daprd placement stream connecting
+// (+1) or disconnecting (-1) for the given namespace.
+func RecordPlacementStreamsConnected(namespace string, delta int64) {
+	placementStreamsLock.Lock()
+	defer placementStreamsLock.Unlock()
+	placementStreamsCounts[namespace] += delta
+	current := placementStreamsCounts[namespace]
+	if current <= 0 {
+		delete(placementStreamsCounts, namespace)
+	}
+	stats.RecordWithTags(context.Background(),
+		utils.WithTags(placementStreamsGauge.Name(), tagNamespace, namespace),
+		placementStreamsGauge.M(current))
+}
+
+// RecordPlacementDissemination records a placement dissemination round
+// starting for the given namespace.
+func RecordPlacementDissemination(namespace string) {
+	stats.RecordWithTags(context.Background(),
+		utils.WithTags(placementDisseminationsTotal.Name(), tagNamespace, namespace),
+		placementDisseminationsTotal.M(1))
+}
+
+// RecordPlacementDisseminationLatency records the duration of a completed
+// placement dissemination round for the given namespace.
+func RecordPlacementDisseminationLatency(namespace string, elapsed time.Duration) {
+	stats.RecordWithTags(context.Background(),
+		utils.WithTags(placementDisseminationLatency.Name(), tagNamespace, namespace),
+		placementDisseminationLatency.M(float64(elapsed.Milliseconds())))
+}
+
+// RecordPlacementIncapableSidecars records the current number of connected
+// sidecars which cannot use scheduler placement.
+func RecordPlacementIncapableSidecars(current int64) {
+	stats.RecordWithTags(context.Background(),
+		utils.WithTags(placementIncapableSidecarsGauge.Name()),
+		placementIncapableSidecarsGauge.M(current))
+}
+
+// RecordPlacementTableUpdate records a per actor type placement table rebuild
+// being disseminated.
+func RecordPlacementTableUpdate(namespace, actorType string) {
+	stats.RecordWithTags(context.Background(),
+		utils.WithTags(placementTableUpdatesTotal.Name(), tagNamespace, namespace, tagActorType, actorType),
+		placementTableUpdatesTotal.M(1))
+}
+
+var tagSidecarsConnected = utils.WithTags(sidecarsConnectedGauge.Name())
+
+// RecordSidecarsConnectedCount records the number of dapr sidecars connected to the scheduler service
+func RecordSidecarsConnectedCount(change int) {
+	current := atomic.AddInt64(&sidecarConnectionCount, int64(change))
+	stats.RecordWithTags(context.Background(), tagSidecarsConnected, sidecarsConnectedGauge.M(current))
+}
+
+var (
+	tagTotalJob     = utils.WithTags(jobsScheduledTotal.Name(), tagType, "job")
+	tagTotalActor   = utils.WithTags(jobsScheduledTotal.Name(), tagType, "actor")
+	tagTotalUnknown = utils.WithTags(jobsScheduledTotal.Name(), tagType, "unknown")
+)
+
+// RecordJobsScheduledCount records the number of jobs scheduled to the scheduler service
+func RecordJobsScheduledCount(jobMetadata *schedulerv1pb.JobMetadata) {
+	var tag []tag.Mutator
+	switch jobMetadata.GetTarget().GetType().(type) {
+	case *schedulerv1pb.JobTargetMetadata_Job:
+		tag = tagTotalJob
+	case *schedulerv1pb.JobTargetMetadata_Actor:
+		tag = tagTotalActor
+	default:
+		tag = tagTotalUnknown
+	}
+
+	stats.RecordWithTags(context.Background(), tag, jobsScheduledTotal.M(1))
+}
+
+var (
+	tagTriggeredJob     = utils.WithTags(jobsTriggeredTotal.Name(), tagType, "job")
+	tagTriggeredActor   = utils.WithTags(jobsTriggeredTotal.Name(), tagType, "actor")
+	tagTriggeredUnknown = utils.WithTags(jobsTriggeredTotal.Name(), tagType, "unknown")
+)
+
+// RecordJobsTriggeredCount records the total number of jobs successfully triggered from the scheduler service
+func RecordJobsTriggeredCount(jobMetadata *schedulerv1pb.JobMetadata) {
+	var tag []tag.Mutator
+	switch jobMetadata.GetTarget().GetType().(type) {
+	case *schedulerv1pb.JobTargetMetadata_Job:
+		tag = tagTriggeredJob
+	case *schedulerv1pb.JobTargetMetadata_Actor:
+		tag = tagTriggeredActor
+	default:
+		tag = tagTriggeredUnknown
+	}
+
+	stats.RecordWithTags(context.Background(), tag, jobsTriggeredTotal.M(1))
+}
+
+var (
+	tagTriggerLatencyJob     = utils.WithTags(triggerLatency.Name(), tagType, "job")
+	tagTriggerLatencyActor   = utils.WithTags(triggerLatency.Name(), tagType, "actor")
+	tagTriggerLatencyUnknown = utils.WithTags(triggerLatency.Name(), tagType, "unknown")
+)
+
+// RecordTriggerDuration records the time it takes to send the job to dapr from the scheduler service
+func RecordTriggerDuration(jobMetadata *schedulerv1pb.JobMetadata, duration time.Duration) {
+	var tag []tag.Mutator
+	switch jobMetadata.GetTarget().GetType().(type) {
+	case *schedulerv1pb.JobTargetMetadata_Job:
+		tag = tagTriggerLatencyJob
+	case *schedulerv1pb.JobTargetMetadata_Actor:
+		tag = tagTriggerLatencyActor
+	default:
+		tag = tagTriggerLatencyUnknown
+	}
+	stats.RecordWithTags(context.Background(), tag, triggerLatency.M(float64(duration.Milliseconds())))
+}
+
+var (
+	tagFailedJob     = utils.WithTags(jobsFailedTotal.Name(), tagType, "job")
+	tagFailedActor   = utils.WithTags(jobsFailedTotal.Name(), tagType, "actor")
+	tagFailedUnknown = utils.WithTags(jobsFailedTotal.Name(), tagType, "unknown")
+)
+
+// RecordJobsFailed records the total number of failed jobs
+func RecordJobsFailedCount(jobMetadata *schedulerv1pb.JobMetadata) {
+	var tag []tag.Mutator
+	switch jobMetadata.GetTarget().GetType().(type) {
+	case *schedulerv1pb.JobTargetMetadata_Job:
+		tag = tagFailedJob
+	case *schedulerv1pb.JobTargetMetadata_Actor:
+		tag = tagFailedActor
+	default:
+		tag = tagFailedUnknown
+	}
+
+	stats.RecordWithTags(context.Background(), tag, jobsFailedTotal.M(1))
+}
+
+var (
+	tagUndeliveredJob     = utils.WithTags(jobsUndeliveredTotal.Name(), tagType, "job")
+	tagUndeliveredActor   = utils.WithTags(jobsUndeliveredTotal.Name(), tagType, "actor")
+	tagUndeliveredUnknown = utils.WithTags(jobsUndeliveredTotal.Name(), tagType, "unknown")
+)
+
+// RecordJobsUndelivered records the total number of undelivered jobs
+func RecordJobsUndeliveredCount(jobMetadata *schedulerv1pb.JobMetadata) {
+	var tag []tag.Mutator
+	switch jobMetadata.GetTarget().GetType().(type) {
+	case *schedulerv1pb.JobTargetMetadata_Job:
+		tag = tagUndeliveredJob
+	case *schedulerv1pb.JobTargetMetadata_Actor:
+		tag = tagUndeliveredActor
+	default:
+		tag = tagUndeliveredUnknown
+	}
+
+	stats.RecordWithTags(context.Background(), tag, jobsUndeliveredTotal.M(1))
+}
+
+// RecordConcurrencyInflight records the current in-flight count for a
+// concurrency gate on this scheduler instance.
+func RecordConcurrencyInflight(key string, count int64) {
+	stats.RecordWithTags(context.Background(),
+		utils.WithTags(concurrencyInflightGauge.Name(), tagConcurrencyKey, key),
+		concurrencyInflightGauge.M(count),
+	)
+}
+
+// RecordConcurrencyPending records the current pending count for a
+// concurrency gate on this scheduler instance.
+func RecordConcurrencyPending(key string, count int64) {
+	stats.RecordWithTags(context.Background(),
+		utils.WithTags(concurrencyPendingGauge.Name(), tagConcurrencyKey, key),
+		concurrencyPendingGauge.M(count),
+	)
+}
+
+// RecordConcurrencyThrottled records that a trigger was throttled by a
+// concurrency gate.
+func RecordConcurrencyThrottled(key string) {
+	stats.RecordWithTags(context.Background(),
+		utils.WithTags(concurrencyThrottledTotal.Name(), tagConcurrencyKey, key),
+		concurrencyThrottledTotal.M(1),
+	)
+}
+
+// RecordWorkflowActivityBacklog records the number of pull-dispatched
+// activities of one name waiting for a free sidecar slot on this scheduler
+// instance.
+func RecordWorkflowActivityBacklog(namespace, appID, activityName string, count int64) {
+	recordWorkflowActivity(workflowActivityBacklogGauge, namespace, appID, activityName, count)
+}
+
+// RecordWorkflowActivityInflight records the number of pull-dispatched
+// activities of one name this scheduler instance handed to a sidecar and that
+// have not finished.
+func RecordWorkflowActivityInflight(namespace, appID, activityName string, count int64) {
+	recordWorkflowActivity(workflowActivityInflightGauge, namespace, appID, activityName, count)
+}
+
+// RecordWorkflowActivityRefused counts a pull-dispatched activity a sidecar
+// refused with NO_CAPACITY because another scheduler took its last slot.
+func RecordWorkflowActivityRefused(namespace, appID, activityName string) {
+	recordWorkflowActivity(workflowActivityRefusedTotal, namespace, appID, activityName, 1)
+}
+
+func recordWorkflowActivity(measure *stats.Int64Measure, namespace, appID, activityName string, count int64) {
+	stats.RecordWithTags(context.Background(),
+		utils.WithTags(measure.Name(),
+			tagNamespace, namespace,
+			tagAppID, appID,
+			tagActivityName, activityName,
+		),
+		measure.M(count),
+	)
+}
+
+var (
+	tagDeletedJob     = utils.WithTags(jobsDeletedTotal.Name(), tagType, "job")
+	tagDeletedActor   = utils.WithTags(jobsDeletedTotal.Name(), tagType, "actor")
+	tagDeletedUnknown = utils.WithTags(jobsDeletedTotal.Name(), tagType, "unknown")
+)
+
+// RecordJobsDeletedCount records the number of jobs deleted from the scheduler service.
+func RecordJobsDeletedCount(jobMetadata *schedulerv1pb.JobMetadata) {
+	var tag []tag.Mutator
+	switch jobMetadata.GetTarget().GetType().(type) {
+	case *schedulerv1pb.JobTargetMetadata_Job:
+		tag = tagDeletedJob
+	case *schedulerv1pb.JobTargetMetadata_Actor:
+		tag = tagDeletedActor
+	default:
+		tag = tagDeletedUnknown
+	}
+
+	stats.RecordWithTags(context.Background(), tag, jobsDeletedTotal.M(1))
+}
+
+var tagBulkDeleted = utils.WithTags(jobsBulkDeletedTotal.Name())
+
+// RecordJobsBulkDeletedCount records a bulk job deletion operation.
+func RecordJobsBulkDeletedCount() {
+	stats.RecordWithTags(context.Background(), tagBulkDeleted, jobsBulkDeletedTotal.M(1))
+}
+
+var (
+	tagCreatedFailedJob     = utils.WithTags(jobsCreatedFailedTotal.Name(), tagType, "job")
+	tagCreatedFailedActor   = utils.WithTags(jobsCreatedFailedTotal.Name(), tagType, "actor")
+	tagCreatedFailedUnknown = utils.WithTags(jobsCreatedFailedTotal.Name(), tagType, "unknown")
+)
+
+// RecordJobsCreatedFailedCount records a failed job creation attempt.
+func RecordJobsCreatedFailedCount(jobMetadata *schedulerv1pb.JobMetadata) {
+	var tag []tag.Mutator
+	switch jobMetadata.GetTarget().GetType().(type) {
+	case *schedulerv1pb.JobTargetMetadata_Job:
+		tag = tagCreatedFailedJob
+	case *schedulerv1pb.JobTargetMetadata_Actor:
+		tag = tagCreatedFailedActor
+	default:
+		tag = tagCreatedFailedUnknown
+	}
+
+	stats.RecordWithTags(context.Background(), tag, jobsCreatedFailedTotal.M(1))
+}
+
+var (
+	tagSidecarErrorSendFailed = utils.WithTags(sidecarErrorsTotal.Name(), tagReason, "send_failed")
+	tagSidecarErrorRecvFailed = utils.WithTags(sidecarErrorsTotal.Name(), tagReason, "recv_failed")
+	tagSidecarErrorAuthFailed = utils.WithTags(sidecarErrorsTotal.Name(), tagReason, "auth_failed")
+)
+
+// RecordSidecarSendError records a sidecar stream send error.
+func RecordSidecarSendError() {
+	stats.RecordWithTags(context.Background(), tagSidecarErrorSendFailed, sidecarErrorsTotal.M(1))
+}
+
+// RecordSidecarRecvError records a sidecar stream receive error.
+func RecordSidecarRecvError() {
+	stats.RecordWithTags(context.Background(), tagSidecarErrorRecvFailed, sidecarErrorsTotal.M(1))
+}
+
+// RecordSidecarAuthError records a sidecar authorization error.
+func RecordSidecarAuthError() {
+	stats.RecordWithTags(context.Background(), tagSidecarErrorAuthFailed, sidecarErrorsTotal.M(1))
+}
+
+// InitMetrics initialize the scheduler service metrics.
+func InitMetrics() error {
+	err := view.Register(
+		utils.NewMeasureView(sidecarsConnectedGauge, []tag.Key{}, view.LastValue()),
+		utils.NewMeasureView(jobsScheduledTotal, []tag.Key{tagType}, view.Count()),
+		utils.NewMeasureView(jobsTriggeredTotal, []tag.Key{tagType}, view.Count()),
+		utils.NewMeasureView(triggerLatency, []tag.Key{tagType}, view.Distribution(0, 100, 500, 1000, 5000, 10000)),
+		utils.NewMeasureView(jobsFailedTotal, []tag.Key{tagType}, view.Count()),
+		utils.NewMeasureView(jobsUndeliveredTotal, []tag.Key{tagType}, view.Count()),
+		utils.NewMeasureView(concurrencyInflightGauge, []tag.Key{tagConcurrencyKey}, view.LastValue()),
+		utils.NewMeasureView(concurrencyPendingGauge, []tag.Key{tagConcurrencyKey}, view.LastValue()),
+		utils.NewMeasureView(concurrencyThrottledTotal, []tag.Key{tagConcurrencyKey}, view.Count()),
+		utils.NewMeasureView(workflowActivityBacklogGauge, []tag.Key{tagNamespace, tagAppID, tagActivityName}, view.LastValue()),
+		utils.NewMeasureView(workflowActivityInflightGauge, []tag.Key{tagNamespace, tagAppID, tagActivityName}, view.LastValue()),
+		utils.NewMeasureView(workflowActivityRefusedTotal, []tag.Key{tagNamespace, tagAppID, tagActivityName}, view.Count()),
+		utils.NewMeasureView(jobsDeletedTotal, []tag.Key{tagType}, view.Count()),
+		utils.NewMeasureView(jobsBulkDeletedTotal, []tag.Key{}, view.Count()),
+		utils.NewMeasureView(jobsCreatedFailedTotal, []tag.Key{tagType}, view.Count()),
+		utils.NewMeasureView(sidecarErrorsTotal, []tag.Key{tagReason}, view.Count()),
+		utils.NewMeasureView(placementLeaderGauge, []tag.Key{}, view.LastValue()),
+		utils.NewMeasureView(placementStreamsGauge, []tag.Key{tagNamespace}, view.LastValue()),
+		utils.NewMeasureView(placementDisseminationsTotal, []tag.Key{tagNamespace}, view.Count()),
+		utils.NewMeasureView(placementDisseminationLatency, []tag.Key{tagNamespace}, view.Distribution(0, 10, 100, 500, 1000, 5000, 10000)),
+		utils.NewMeasureView(placementTableUpdatesTotal, []tag.Key{tagNamespace, tagActorType}, view.Count()),
+		utils.NewMeasureView(placementIncapableSidecarsGauge, []tag.Key{}, view.LastValue()),
+	)
+
+	return err
+}

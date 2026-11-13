@@ -1,0 +1,170 @@
+/*
+Copyright 2024 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package scheduler
+
+import (
+	"context"
+	"fmt"
+	"slices"
+
+	"github.com/dapr/dapr/pkg/actors"
+	"github.com/dapr/dapr/pkg/config"
+	"github.com/dapr/dapr/pkg/healthz"
+	"github.com/dapr/dapr/pkg/runtime/channels"
+	"github.com/dapr/dapr/pkg/runtime/scheduler/client"
+	"github.com/dapr/dapr/pkg/runtime/scheduler/internal/clients"
+	"github.com/dapr/dapr/pkg/runtime/scheduler/internal/clients/wrapper"
+	"github.com/dapr/dapr/pkg/runtime/scheduler/internal/loops"
+	"github.com/dapr/dapr/pkg/runtime/scheduler/internal/loops/connector"
+	"github.com/dapr/dapr/pkg/runtime/scheduler/internal/loops/hosts"
+	"github.com/dapr/dapr/pkg/runtime/scheduler/internal/watchhosts"
+	"github.com/dapr/dapr/pkg/runtime/scheduler/leadership"
+	"github.com/dapr/dapr/pkg/runtime/wfengine"
+	"github.com/dapr/dapr/pkg/security"
+	"github.com/dapr/kit/concurrency"
+	"github.com/dapr/kit/events/loop"
+)
+
+type Options struct {
+	Namespace        string
+	AppID            string
+	Actors           actors.Interface
+	Channels         *channels.Channels
+	WFEngine         wfengine.Interface
+	WorkflowSpec     *config.WorkflowSpec
+	Addresses        []string
+	Security         security.Handler
+	Healthz          healthz.Healthz
+	SchedulerStreams uint
+
+	// PlacementAddresses are the placement service addresses this daprd was
+	// configured with, reported to the schedulers so they can detect a
+	// placement service outside the well-known service name.
+	PlacementAddresses []string
+	// ActorAddress is the daprd internal gRPC host:port reported on
+	// WatchJobs streams, so schedulers route actor reminder triggers to
+	// the placement owner host.
+	ActorAddress string
+}
+
+// Scheduler manages the connection to the cluster of schedulers.
+type Scheduler struct {
+	connector  loop.Interface[loops.EventConn]
+	hosts      loop.Interface[loops.EventHost]
+	watchhosts *watchhosts.WatchHosts
+	client     client.Interface
+	leadership *leadership.Leadership
+
+	currentActorTypes *[]string
+}
+
+func New(opts Options) (*Scheduler, error) {
+	connector := connector.New(connector.Options{
+		Namespace:          opts.Namespace,
+		AppID:              opts.AppID,
+		ActorAddress:       opts.ActorAddress,
+		WorkflowSpec:       opts.WorkflowSpec,
+		Actors:             opts.Actors,
+		Channels:           opts.Channels,
+		WFEngine:           opts.WFEngine,
+		PlacementAddresses: opts.PlacementAddresses,
+	})
+
+	if opts.SchedulerStreams < 1 {
+		return nil, fmt.Errorf("must define at least 1 scheduler stream, got %d", opts.SchedulerStreams)
+	}
+
+	hosts := hosts.New(hosts.Options{
+		Security:  opts.Security,
+		Connector: connector,
+		StreamN:   opts.SchedulerStreams,
+	})
+
+	clients := clients.New(clients.Options{
+		Security: opts.Security,
+	})
+
+	leadership := leadership.New()
+
+	watchhosts := watchhosts.New(watchhosts.Options{
+		HostLoop:   hosts,
+		Addresses:  opts.Addresses,
+		Security:   opts.Security,
+		Clients:    clients,
+		Healthz:    opts.Healthz,
+		Leadership: leadership,
+	})
+
+	return &Scheduler{
+		connector:  connector,
+		hosts:      hosts,
+		watchhosts: watchhosts,
+		leadership: leadership,
+		client: wrapper.New(wrapper.Options{
+			Clients: clients,
+		}),
+	}, nil
+}
+
+// Leadership returns the store tracking the scheduler placement leader as
+// observed on the WatchHosts stream.
+func (s *Scheduler) Leadership() *leadership.Leadership {
+	return s.leadership
+}
+
+func (s *Scheduler) Run(ctx context.Context) error {
+	return concurrency.NewRunnerManager(
+		s.connector.Run,
+		s.hosts.Run,
+		s.watchhosts.Run,
+		func(ctx context.Context) error {
+			<-ctx.Done()
+			s.hosts.Close(new(loops.Close))
+			s.connector.Close(new(loops.Close))
+
+			return ctx.Err()
+		},
+	).Run(ctx)
+}
+
+func (s *Scheduler) StartApp() {
+	s.currentActorTypes = nil
+	s.connector.Enqueue(&loops.Reconnect{
+		AppTarget: new(true),
+	})
+}
+
+func (s *Scheduler) StopApp() {
+	s.currentActorTypes = nil
+	s.connector.Enqueue(&loops.Reconnect{
+		AppTarget: new(false),
+	})
+}
+
+func (s *Scheduler) ReloadActorTypes(actorTypes []string) {
+	slices.Sort(actorTypes)
+
+	if s.currentActorTypes != nil && slices.Equal(*s.currentActorTypes, actorTypes) {
+		return
+	}
+
+	s.currentActorTypes = new(actorTypes)
+	s.connector.Enqueue(&loops.Reconnect{
+		ActorTypes: new(actorTypes),
+	})
+}
+
+func (s *Scheduler) Client() client.Interface {
+	return s.client
+}

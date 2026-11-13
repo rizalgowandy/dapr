@@ -1,0 +1,530 @@
+/*
+Copyright 2026 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package placement
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/dapr/dapr/pkg/actors/internal/placement/connector"
+	"github.com/dapr/dapr/pkg/actors/internal/placement/connector/leader"
+	"github.com/dapr/dapr/pkg/actors/internal/placement/loops"
+	"github.com/dapr/dapr/pkg/actors/internal/placement/loops/disseminator"
+	"github.com/dapr/dapr/pkg/actors/internal/placement/loops/disseminator/inflight"
+	"github.com/dapr/dapr/pkg/actors/internal/placement/loops/stream/transport"
+	"github.com/dapr/dapr/pkg/actors/table"
+	"github.com/dapr/dapr/pkg/healthz"
+	"github.com/dapr/dapr/pkg/retry"
+	schedclient "github.com/dapr/dapr/pkg/runtime/scheduler/client"
+	"github.com/dapr/dapr/pkg/runtime/scheduler/leadership"
+	"github.com/dapr/kit/events/loop"
+	"github.com/dapr/kit/logger"
+)
+
+var log = logger.NewLogger("dapr.runtime.actors.placement.loops.placement")
+
+const startupWaitDefault = time.Second * 30
+
+var errStartupTimeout = errors.New("no scheduler placement advertisement before the timeout")
+
+type Options struct {
+	Hostname  string
+	Port      string
+	ID        string
+	Namespace string
+
+	Ready *atomic.Bool
+
+	Healthz       healthz.Healthz
+	Connector     connector.Interface
+	InitialReport *loops.Report
+
+	// StreamFactory opens a placement stream on an established connection,
+	// selecting the wire protocol (v1 placement service, v2 scheduler).
+	StreamFactory func(ctx context.Context, conn *grpc.ClientConn) (transport.Transport, error)
+
+	// SchedulerPlacement selects the v2 wire protocol on the stream.
+	SchedulerPlacement bool
+
+	// Fallback, when non-nil, is the v1 placement service connector to use
+	// when the scheduler cluster reports it does not serve placement. After
+	// the startup choice the other authority's connector is kept, so a
+	// control plane handover is adopted without a restart.
+	Fallback *Fallback
+
+	// Leadership tracks the scheduler's placement advertisement, the only
+	// signal which moves this sidecar off the placement service.
+	Leadership *leadership.Leadership
+
+	ActorTable table.Interface
+	Scheduler  schedclient.Reloader
+
+	DisseminationTimeout time.Duration
+
+	StartupTimeout time.Duration
+}
+
+// Fallback is a secondary connector and stream factory to switch to when the
+// primary is unsupported by the cluster.
+type Fallback struct {
+	Connector     connector.Interface
+	StreamFactory func(ctx context.Context, conn *grpc.ClientConn) (transport.Transport, error)
+
+	// SchedulerPlacement marks the connector for scheduler-served
+	// placement, which speaks the v2 wire protocol.
+	SchedulerPlacement bool
+}
+
+// swapAlt exchanges the active connector with the kept alternative.
+func (p *placement) swapAlt() {
+	p.alt, p.connector, p.streamFactory, p.schedulerPlacement = &Fallback{
+		Connector:          p.connector,
+		StreamFactory:      p.streamFactory,
+		SchedulerPlacement: p.schedulerPlacement,
+	}, p.alt.Connector, p.alt.StreamFactory, p.alt.SchedulerPlacement
+}
+
+type placement struct {
+	id        string
+	namespace string
+
+	ready *atomic.Bool
+
+	actorTable table.Interface
+	scheduler  schedclient.Reloader
+
+	// remote is what the last completed dissemination round showed of the
+	// actor types other daprds host, kept across stream loss. See
+	// remotehosts.go.
+	remote remoteHosts
+
+	inflight  *inflight.Inflight
+	connector connector.Interface
+	loop      loop.Interface[loops.EventPlace]
+	htarget   healthz.Target
+
+	lookups []loops.EventLookup
+
+	idx uint64
+
+	dissLoop           loop.Interface[loops.EventDiss]
+	leadership         *leadership.Leadership
+	report             *loops.Report
+	streamFactory      func(ctx context.Context, conn *grpc.ClientConn) (transport.Transport, error)
+	schedulerPlacement bool
+	fallback           *Fallback
+
+	// alt is the connector of whichever placement authority is not active,
+	// so an authority handing over is adopted live: every actor was already
+	// halted when the previous stream closed.
+	alt *Fallback
+
+	dissTimeout time.Duration
+	startupWait time.Duration
+
+	wg sync.WaitGroup
+}
+
+func New(opts Options) loop.Interface[loops.EventPlace] {
+	place := &placement{
+		id:                 opts.ID,
+		ready:              opts.Ready,
+		namespace:          opts.Namespace,
+		connector:          opts.Connector,
+		report:             opts.InitialReport,
+		streamFactory:      opts.StreamFactory,
+		schedulerPlacement: opts.SchedulerPlacement,
+		fallback:           opts.Fallback,
+		leadership:         opts.Leadership,
+		htarget:            opts.Healthz.AddTarget("internal-placement-service"),
+		inflight: inflight.New(inflight.Options{
+			Hostname: opts.Hostname,
+			Port:     opts.Port,
+		}),
+		actorTable:  opts.ActorTable,
+		scheduler:   opts.Scheduler,
+		dissTimeout: opts.DisseminationTimeout,
+		startupWait: opts.StartupTimeout,
+	}
+	if place.startupWait <= 0 {
+		place.startupWait = startupWaitDefault
+	}
+	place.loop = loop.New[loops.EventPlace](8).NewLoop(place)
+	return place.loop
+}
+
+func (p *placement) Handle(ctx context.Context, event loops.EventPlace) error {
+	err := p.handle(ctx, event)
+	if err != nil {
+		// The loop stops on an error, so Shutdown is never handled: close the
+		// WatchRemoteHosts channels here, as nothing else would.
+		p.remote.close()
+	}
+	return err
+}
+
+func (p *placement) handle(ctx context.Context, event loops.EventPlace) error {
+	switch e := event.(type) {
+	case *loops.StreamOrder:
+		p.handleOrder(e)
+	case *loops.LookupRequest:
+		p.handleLookupRequest(e)
+	case *loops.LockRequest:
+		p.handleLockRequest(e)
+	case *loops.PlacementReconnect:
+		return p.handleReconnect(ctx, e)
+	case *loops.ConnCloseStream:
+		return p.handleCloseStream(ctx, e)
+	case *loops.UpdateTypes:
+		p.handleUpdateTypes(e)
+	case *loops.ReloadReminderTypes:
+		// No stream yet: the first dissemination round sends the reminder
+		// types to the scheduler.
+		if p.dissLoop != nil {
+			p.dissLoop.Enqueue(e)
+		}
+	case *loops.WatchRemoteHosts:
+		p.remote.watch(e, p.loop)
+	case *loops.UnwatchRemoteHosts:
+		p.remote.unwatch(e.ActorType, e.Ch)
+	case *loops.RoundCompleted:
+		p.remote.roundCompleted(e)
+	case *loops.SetDrainOngoingCallTimeout:
+		p.handleSetDrainOngoingCallTimeout(e)
+	case *loops.SetEntityDrainOngoingCallTimeouts:
+		p.inflight.SetEntityDrainOngoingCallTimeouts(e.Timeouts)
+	case *loops.Shutdown:
+		p.handleShutdown(e)
+	default:
+		panic(fmt.Sprintf("unknown placement event type: %T", e))
+	}
+
+	return nil
+}
+
+func (p *placement) handleUpdateTypes(up *loops.UpdateTypes) {
+	p.report.ActorTypes = up.ActorTypes
+
+	// No stream yet. The types go out with the initial report on connect.
+	if p.dissLoop == nil {
+		return
+	}
+
+	p.dissLoop.Enqueue(&loops.ReportHost{
+		Report: p.report.Clone(),
+	})
+}
+
+func (p *placement) handleOrder(order *loops.StreamOrder) {
+	if p.idx != order.IDx {
+		log.Debugf("Dropping order from placement idx %d, current idx is %d", order.IDx, p.idx)
+		return
+	}
+	p.dissLoop.Enqueue(order)
+}
+
+func (p *placement) handleLookupRequest(req *loops.LookupRequest) {
+	if p.dissLoop == nil {
+		p.lookups = append(p.lookups, req)
+		return
+	}
+	p.dissLoop.Enqueue(req)
+}
+
+func (p *placement) handleLockRequest(req *loops.LockRequest) {
+	if p.dissLoop == nil {
+		p.lookups = append(p.lookups, req)
+		return
+	}
+	p.dissLoop.Enqueue(req)
+}
+
+func (p *placement) handleReconnect(ctx context.Context, recon *loops.PlacementReconnect) error {
+	var client transport.Transport
+	var streamCancel context.CancelFunc
+	var err error
+	var unavailableLogged bool
+	adoptFallback := func() {
+		p.alt = &Fallback{
+			Connector:          p.connector,
+			StreamFactory:      p.streamFactory,
+			SchedulerPlacement: p.schedulerPlacement,
+		}
+		p.connector = p.fallback.Connector
+		p.streamFactory = p.fallback.StreamFactory
+		p.schedulerPlacement = p.fallback.SchedulerPlacement
+		p.fallback = nil
+	}
+
+	for {
+		cctx := ctx
+		var ccancel context.CancelCauseFunc
+		var timer *time.Timer
+		if p.fallback != nil && p.schedulerPlacement {
+			cctx, ccancel = context.WithCancelCause(ctx)
+			timer = time.AfterFunc(p.startupWait, func() { ccancel(errStartupTimeout) })
+		}
+		client, streamCancel, err = p.tryConnect(ctx, cctx)
+		if timer != nil {
+			timer.Stop()
+		}
+		if err == nil {
+			break
+		}
+		if ccancel != nil {
+			ccancel(err)
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if p.fallback != nil && p.schedulerPlacement && errors.Is(context.Cause(cctx), errStartupTimeout) {
+			// A reachable scheduler withholds the leader only until this
+			// sidecar registers on WatchJobs, so keep waiting for it rather
+			// than split off to the placement service. Fall back only when
+			// no scheduler has been reachable at all.
+			if p.leadership != nil && p.leadership.Reachable() {
+				log.Warnf("Scheduler reachable but no placement leader advertised after %s, still waiting", p.startupWait)
+				continue
+			}
+			log.Warn("No scheduler reachable before the timeout, using the placement service")
+			adoptFallback()
+			continue
+		}
+
+		// The scheduler cluster does not serve placement. Only reachable
+		// before an authority is chosen: the fallback is cleared on the
+		// first successful connect.
+		if errors.Is(err, leader.ErrSchedulerPlacementUnsupported) {
+			if p.fallback != nil {
+				log.Warn("Scheduler cluster does not serve actor placement, using the placement service")
+				adoptFallback()
+				continue
+			}
+
+			// The cluster no longer serves scheduler placement: try the
+			// placement service. Only this explicit signal defects, a
+			// leaderless scheduler failover blocks in the connector instead.
+			if p.alt != nil {
+				p.swapAlt()
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(retry.Jitter(time.Second/2, time.Second/4)):
+				}
+				continue
+			}
+
+			// Nothing can place actors right now: come up with actor APIs
+			// disconnected and quietly retry until a scheduler serves
+			// placement.
+			if !unavailableLogged {
+				unavailableLogged = true
+				log.Error("Actor placement unavailable: the scheduler does not serve actor placement and no placement service is available to this sidecar. Actor and Workflow APIs will be unavailable until the scheduler serves placement")
+				p.ready.Store(false)
+				p.htarget.Ready()
+			}
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(retry.Jitter(time.Millisecond*300, time.Millisecond*150)):
+			}
+			continue
+		}
+
+		log.Errorf("Failed to connect to placement service: %s. Retrying...", err)
+
+		// An unreachable placement service is not by itself a handover
+		// signal. Only the scheduler's placement advertisement moves this
+		// sidecar off the placement service.
+		if p.alt != nil && p.alt.SchedulerPlacement && p.leadership != nil {
+			if addr, _, _ := p.leadership.Leader(); addr != "" {
+				log.Warn("Placement service unreachable while a scheduler advertises actor placement, adopting it")
+				p.swapAlt()
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(retry.Jitter(time.Second/2, time.Second/4)):
+		}
+	}
+
+	// The other authority's connector is kept, so a later handover in
+	// either direction is adopted without a restart.
+	if p.fallback != nil {
+		p.alt = p.fallback
+		p.fallback = nil
+	}
+
+	connected := "Connected to placement service: %s"
+	if p.schedulerPlacement {
+		connected = "Connected to scheduler placement leader %s"
+	}
+	if recon.TransientPrior {
+		log.Debugf(connected, p.connector.Address())
+	} else {
+		log.Infof(connected, p.connector.Address())
+	}
+
+	p.idx++
+
+	p.dissLoop = disseminator.New(ctx, disseminator.Options{
+		ID:                   p.id,
+		Namespace:            p.namespace,
+		Inflight:             p.inflight,
+		Channel:              client,
+		StreamCancel:         streamCancel,
+		PlacementLoop:        p.loop,
+		IDx:                  p.idx,
+		ActorTable:           p.actorTable,
+		Scheduler:            p.scheduler,
+		HTarget:              p.htarget,
+		DisseminationTimeout: p.dissTimeout,
+		Ready:                p.ready,
+		SchedulerPlacement:   p.schedulerPlacement,
+	})
+
+	p.wg.Go(func() {
+		derr := p.dissLoop.Run(ctx)
+		if derr != nil {
+			log.Errorf("Placement dissemination loop exited with error: %s", derr)
+		}
+	})
+
+	if recon.ActorTypes != nil {
+		p.report.ActorTypes = *recon.ActorTypes
+	}
+
+	if recon.TransientPrior {
+		log.Debugf("Reporting initial host to placement service with initial types %v", p.report.ActorTypes)
+	} else {
+		log.Infof("Reporting initial host to placement service with initial types %v", p.report.ActorTypes)
+	}
+	p.dissLoop.Enqueue(&loops.ReportHost{
+		Report: p.report.Clone(),
+	})
+
+	for _, l := range p.lookups {
+		p.dissLoop.Enqueue(l.(loops.EventDiss))
+	}
+	p.lookups = nil
+
+	return nil
+}
+
+func (p *placement) handleCloseStream(ctx context.Context, closeStream *loops.ConnCloseStream) error {
+	if closeStream.IDx != p.idx {
+		log.Infof("Ignoring close stream for idx %d, current idx is %d", closeStream.IDx, p.idx)
+		return nil
+	}
+
+	p.ready.Store(false)
+
+	p.dissLoop.Close(&loops.Shutdown{
+		Error: closeStream.Error,
+	})
+	p.wg.Wait()
+	disseminator.LoopFactoryCache.CacheLoop(p.dissLoop)
+
+	// A new stream session starts from its authoritative snapshot.
+	p.inflight.ResetSession()
+
+	if err := p.actorTable.HaltAll(ctx); err != nil {
+		log.Errorf("Failed to halt all actors during placement disconnection: %v", err)
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// Classify this close so the matching reconnect's per-cycle log lines
+	// (Connected to placement service, Reporting initial host) follow the
+	// same level. Threaded onto the PlacementReconnect event we hand to
+	// handleReconnect rather than carried as receiver state, so there's no
+	// stale carry-over between unrelated close events.
+	transient := loops.IsTransientLeaderError(closeStream.Error)
+	if transient {
+		log.Debugf("Placement stream closed: %v. Reconnecting...", closeStream.Error)
+	} else {
+		log.Infof("Placement stream closed: %v. Reconnecting...", closeStream.Error)
+	}
+
+	// A refusal arrives on the first Recv, not at connect, so the reconnect
+	// cycle has no pause of its own. Back off once so a follower bounce, a
+	// stale advertisement, or a scheduler which stopped serving placement
+	// does not spin HaltAll.
+	switch status.Code(closeStream.Error) {
+	case codes.FailedPrecondition, codes.Unimplemented:
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(retry.Jitter(time.Second/2, time.Second/4)):
+		}
+	}
+
+	return p.handleReconnect(ctx, &loops.PlacementReconnect{TransientPrior: transient})
+}
+
+func (p *placement) handleShutdown(shutdown *loops.Shutdown) {
+	defer p.wg.Wait()
+
+	p.remote.close()
+
+	if p.dissLoop == nil {
+		return
+	}
+
+	p.dissLoop.Close(shutdown)
+}
+
+func (p *placement) handleSetDrainOngoingCallTimeout(event *loops.SetDrainOngoingCallTimeout) {
+	p.inflight.SetDrainOngoingCallTimeout(event.Drain, event.Timeout)
+}
+
+func (p *placement) tryConnect(ctx, connectCtx context.Context) (transport.Transport, context.CancelFunc, error) {
+	conn, err := p.connector.Connect(connectCtx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to placement service: %w", err)
+	}
+
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	client, err := p.streamFactory(streamCtx, conn)
+	if err != nil {
+		streamCancel()
+		// The dial does not block, so it succeeds while placement is down and
+		// only the stream fails. Close the connection, else every retry
+		// leaves one more connection redialing placement.
+		conn.Close()
+		return nil, nil, fmt.Errorf("failed to open stream to placement service: %w", err)
+	}
+
+	// The connection serves only this stream: the next attempt dials a new
+	// one. Close it together with the stream.
+	return client, func() {
+		streamCancel()
+		conn.Close()
+	}, nil
+}

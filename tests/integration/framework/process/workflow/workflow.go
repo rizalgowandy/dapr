@@ -1,0 +1,623 @@
+/*
+Copyright 2024 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package workflow
+
+import (
+	"context"
+	"os"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
+	rtv1 "github.com/dapr/dapr/pkg/proto/runtime/v1"
+	"github.com/dapr/dapr/tests/integration/framework/iowriter/logger"
+	"github.com/dapr/dapr/tests/integration/framework/process/daprd"
+	"github.com/dapr/dapr/tests/integration/framework/process/placement"
+	"github.com/dapr/dapr/tests/integration/framework/process/scheduler"
+	"github.com/dapr/dapr/tests/integration/framework/process/sentry"
+	"github.com/dapr/dapr/tests/integration/framework/process/sqlite"
+	"github.com/dapr/durabletask-go/client"
+	"github.com/dapr/durabletask-go/task"
+	"github.com/dapr/durabletask-go/workflow"
+	kitstrings "github.com/dapr/kit/strings"
+)
+
+// ClusteredDeploymentConfig is a Configuration manifest enabling the
+// WorkflowsClusteredDeployment preview feature.
+const ClusteredDeploymentConfig = `
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+    name: workflowsclustereddeployment
+spec:
+    features:
+    - name: WorkflowsClusteredDeployment
+      enabled: true
+`
+
+// ClusteredDeploymentFromEnv reports whether the suite is running with
+// DAPR_INTEGRATION_WORKFLOW_CLUSTERED set truthy, which enables the
+// WorkflowsClusteredDeployment feature flag on every daprd built by this
+// harness unless a test overrides it with WithClusteredDeployment.
+func ClusteredDeploymentFromEnv() bool {
+	return kitstrings.IsTruthy(os.Getenv("DAPR_INTEGRATION_WORKFLOW_CLUSTERED"))
+}
+
+// FastPathFromEnv reports whether the suite is running with
+// DAPR_INTEGRATION_WORKFLOW_FASTPATH set truthy, which enables the
+// WorkflowsFastPath feature flag on every daprd built by this harness unless
+// a test overrides it with WithFastPath.
+func FastPathFromEnv() bool {
+	return kitstrings.IsTruthy(os.Getenv("DAPR_INTEGRATION_WORKFLOW_FASTPATH"))
+}
+
+// SchedulerPlacementFromEnv reports whether
+// DAPR_INTEGRATION_SCHEDULER_PLACEMENT is set truthy, which has the
+// scheduler serve actor placement for every harness built by this package.
+// Tests which pick a topology, or drive the placement service, keep their
+// choice.
+func SchedulerPlacementFromEnv() bool {
+	return kitstrings.IsTruthy(os.Getenv("DAPR_INTEGRATION_SCHEDULER_PLACEMENT"))
+}
+
+// SigningFromEnv reports whether the suite is running with
+// DAPR_INTEGRATION_WORKFLOW_SIGNING set truthy. WorkflowHistorySigning
+// requires mTLS (daprd fatals otherwise), so signing mode forces a Sentry
+// per workflow, exactly as WithMTLS does, unless a test overrides it with
+// WithSigning.
+func SigningFromEnv() bool {
+	return kitstrings.IsTruthy(os.Getenv("DAPR_INTEGRATION_WORKFLOW_SIGNING"))
+}
+
+// StagedOperationsFromEnv reports whether the suite is running with
+// DAPR_INTEGRATION_WORKFLOW_STAGED set truthy, which enables the
+// WorkflowsStagedOperations feature flag on every daprd built by this harness
+// unless a test overrides it with WithStagedOperations or
+// WithStagedOperationsN.
+func StagedOperationsFromEnv() bool {
+	return kitstrings.IsTruthy(os.Getenv("DAPR_INTEGRATION_WORKFLOW_STAGED"))
+}
+
+type Workflow struct {
+	taskregistry []*task.TaskRegistry
+	db           *sqlite.SQLite
+	place        *placement.Placement
+	sched        *scheduler.Scheduler
+	ownsSched    bool
+	sentry       *sentry.Sentry
+	ownsSentry   bool
+	daprds       []*daprd.Daprd
+	clustered    bool
+	fastPath     bool
+	signing      bool
+
+	schedulerPlacement bool
+
+	stagedOperations bool
+}
+
+func New(t *testing.T, fopts ...Option) *Workflow {
+	t.Helper()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping test on Windows due to SQLite limitations")
+	}
+
+	opts := options{
+		daprds: 1,
+	}
+	for _, fopt := range fopts {
+		fopt(&opts)
+	}
+
+	require.GreaterOrEqual(t, opts.daprds, 1, "at least one daprd instance is required")
+
+	clustered := ClusteredDeploymentFromEnv()
+	if opts.clustered != nil {
+		clustered = *opts.clustered
+	}
+
+	fastPath := FastPathFromEnv()
+	if opts.fastPath != nil {
+		fastPath = *opts.fastPath
+	}
+
+	staged := StagedOperationsFromEnv()
+	if opts.stagedOperations != nil {
+		staged = *opts.stagedOperations
+	}
+
+	schedulerPlacement := SchedulerPlacementFromEnv()
+	// A test which tunes the placement service, brings its own scheduler,
+	// or overrides the scheduler address exercises that topology: the
+	// authority swap does not apply.
+	if len(opts.placementOptions) > 0 || opts.schedulerInstance != nil || opts.schedulerAddress != nil {
+		schedulerPlacement = false
+	}
+	if opts.schedulerPlacement != nil {
+		schedulerPlacement = *opts.schedulerPlacement
+	}
+
+	if opts.sentryInstance != nil {
+		opts.mtls = true
+	}
+	// mTLS implies signing unless a test opts out explicitly; opting out
+	// disables the feature only and leaves the requested mTLS in place.
+	signing := SigningFromEnv() || opts.mtls
+	if opts.signing != nil {
+		signing = *opts.signing
+	}
+	if signing {
+		opts.mtls = true
+	}
+	// A caller-supplied scheduler cannot be given Sentry credentials
+	// retroactively; under mTLS the caller must also supply the Sentry it
+	// built the scheduler (and any proxy) against, or opt out of signing.
+	// Fail loudly instead of timing out on TLS handshakes.
+	if opts.mtls && opts.schedulerInstance != nil && opts.sentryInstance == nil {
+		require.Fail(t, "WithSchedulerInstance under mTLS/signing requires WithSentryInstance (build the scheduler and proxy against that Sentry) or workflow.WithSigning(false)")
+	}
+
+	db := sqlite.New(t,
+		sqlite.WithActorStateStore(true),
+		sqlite.WithCreateStateTables(),
+		sqlite.WithMetadata("busyTimeout", "10s"),
+	)
+
+	var sen *sentry.Sentry
+	ownsSentry := false
+	var placementOpts []placement.Option
+	placementOpts = append(placementOpts, opts.placementOptions...)
+	var schedulerOpts []scheduler.Option
+	schedulerOpts = append(schedulerOpts, opts.schedulerOptions...)
+	if opts.mtls {
+		sen = opts.sentryInstance
+		if sen == nil {
+			sen = sentry.New(t)
+			ownsSentry = true
+		}
+		placementOpts = append(placementOpts, placement.WithSentry(t, sen))
+		// Scheduler ID must match the TLS cert DNS names issued by Sentry.
+		schedulerOpts = append(schedulerOpts,
+			scheduler.WithSentry(sen),
+			scheduler.WithID("dapr-scheduler-server-0"),
+		)
+	}
+
+	// No standalone placement process runs when placement is served by the
+	// scheduler: sidecars take the scheduler's advertisement.
+	var place *placement.Placement
+	if !schedulerPlacement {
+		place = placement.New(t, placementOpts...)
+	} else {
+		schedulerOpts = append(schedulerOpts, scheduler.WithPlacementEnabled(true))
+	}
+	sched := opts.schedulerInstance
+	ownsSched := false
+	if sched == nil {
+		sched = scheduler.New(t, schedulerOpts...)
+		ownsSched = true
+	}
+
+	baseDopts := []daprd.Option{}
+	if place != nil {
+		baseDopts = append(baseDopts, daprd.WithPlacementAddresses(place.Address()))
+	}
+
+	if !opts.skipDB {
+		baseDopts = append(baseDopts, daprd.WithResourceFiles(db.GetComponent(t)))
+	}
+
+	if sen != nil {
+		baseDopts = append(baseDopts, daprd.WithSentry(t, sen))
+	}
+
+	if opts.schedulerAddress != nil {
+		// Reset so a caller-supplied override (e.g. a proxy in front of the
+		// scheduler) truly replaces any addresses appended by other option
+		// layers, instead of being one entry among many.
+		baseDopts = append(baseDopts, daprd.WithSchedulerAddressesReset(*opts.schedulerAddress))
+	} else {
+		baseDopts = append(baseDopts, daprd.WithScheduler(sched))
+	}
+
+	signingDisabled := make(map[int]bool, len(opts.signingDisabled))
+	for _, idx := range opts.signingDisabled {
+		signingDisabled[idx] = true
+	}
+
+	daprds := make([]*daprd.Daprd, opts.daprds)
+
+	for i := range daprds {
+		dopts := make([]daprd.Option, 0, len(baseDopts)+1)
+		dopts = append(dopts, baseDopts...)
+
+		// daprd loads each config file onto one Configuration struct and
+		// spec.features is a slice, so the LAST config file that specifies
+		// features replaces every earlier feature list. All harness-driven
+		// features must therefore land in a single manifest per daprd, built
+		// here because signing and staged operations are per-daprd.
+		stagedI := staged
+		if v, ok := opts.stagedN[i]; ok {
+			stagedI = v
+		}
+		features := baseFeatureList(clustered, fastPath, stagedI)
+		if sen != nil && signing && !signingDisabled[i] {
+			features = append(features[:len(features):len(features)], "WorkflowHistorySigning")
+		}
+		if len(features) > 0 {
+			dopts = append(dopts, daprd.WithFeatureEnabled(t, features...))
+		}
+
+		// Add specific opts for this daprd
+		for _, daprdOpt := range opts.daprdOptions {
+			if daprdOpt.index == i {
+				dopts = append(dopts, daprdOpt.opts...)
+			}
+		}
+
+		daprds[i] = daprd.New(t, dopts...)
+	}
+
+	registries := make(map[int]*task.TaskRegistry)
+	for i := range daprds {
+		registries[i] = task.NewTaskRegistry()
+	}
+
+	// Apply orchestrators & activities to the registry
+	for _, orch := range opts.orchestrators {
+		if orch.index < len(daprds) {
+			require.NoError(t, registries[orch.index].AddWorkflowN(orch.name, orch.fn))
+		}
+	}
+	for _, act := range opts.activities {
+		if act.index < len(daprds) {
+			require.NoError(t, registries[act.index].AddActivityN(act.name, act.fn))
+		}
+	}
+
+	workflow := &Workflow{
+		taskregistry: make([]*task.TaskRegistry, len(daprds)),
+		db:           db,
+		place:        place,
+		sched:        sched,
+		ownsSched:    ownsSched,
+		sentry:       sen,
+		ownsSentry:   ownsSentry,
+		daprds:       daprds,
+		clustered:    clustered,
+		fastPath:     fastPath,
+		signing:      signing,
+
+		schedulerPlacement: schedulerPlacement,
+
+		stagedOperations: staged,
+	}
+
+	for i := range workflow.taskregistry {
+		workflow.taskregistry[i] = registries[i]
+	}
+
+	return workflow
+}
+
+func (w *Workflow) Run(t *testing.T, ctx context.Context) {
+	w.db.Run(t, ctx)
+	if w.sentry != nil && w.ownsSentry {
+		w.sentry.Run(t, ctx)
+	}
+	if w.place != nil {
+		w.place.Run(t, ctx)
+	}
+	if w.ownsSched {
+		w.sched.Run(t, ctx)
+	}
+	for _, daprd := range w.daprds {
+		daprd.Run(t, ctx)
+	}
+}
+
+func (w *Workflow) Cleanup(t *testing.T) {
+	for _, daprd := range w.daprds {
+		daprd.Cleanup(t)
+	}
+	if w.ownsSched {
+		w.sched.Cleanup(t)
+	}
+	if w.place != nil {
+		w.place.Cleanup(t)
+	}
+	if w.sentry != nil && w.ownsSentry {
+		w.sentry.Cleanup(t)
+	}
+	w.db.Cleanup(t)
+}
+
+func (w *Workflow) WaitUntilRunning(t *testing.T, ctx context.Context) {
+	if w.place != nil {
+		w.place.WaitUntilRunning(t, ctx)
+	}
+	if w.sched != nil {
+		w.sched.WaitUntilRunning(t, ctx)
+	}
+	for _, daprd := range w.daprds {
+		daprd.WaitUntilRunning(t, ctx)
+	}
+}
+
+func (w *Workflow) WaitForNoConnectedWorkers(t *testing.T, ctx context.Context) {
+	t.Helper()
+	w.WaitForNoConnectedWorkersN(t, ctx, 0)
+}
+
+func (w *Workflow) WaitForNoConnectedWorkersN(t *testing.T, ctx context.Context, index int) {
+	t.Helper()
+	w.WaitForExactlyConnectedWorkersN(t, ctx, index, 0)
+}
+
+// WaitForExactlyConnectedWorkers waits until daprd index 0 reports exactly
+// count connected workers. See WaitForExactlyConnectedWorkersN.
+func (w *Workflow) WaitForExactlyConnectedWorkers(t *testing.T, ctx context.Context, count int) {
+	t.Helper()
+	w.WaitForExactlyConnectedWorkersN(t, ctx, 0, count)
+}
+
+// WaitForExactlyConnectedWorkersN waits until the daprd at the given index
+// reports exactly count connected workers, for example after one of several
+// workers disconnected.
+func (w *Workflow) WaitForExactlyConnectedWorkersN(t *testing.T, ctx context.Context, index, count int) {
+	t.Helper()
+	require.Less(t, index, len(w.daprds), "index out of range")
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		md := w.DaprN(index).GetMetadata(c, ctx)
+		if !assert.NotNil(c, md) {
+			return
+		}
+		// The workflows metadata field is omitted when there are no connected
+		// workers, so a nil value means zero workers (drained).
+		var connected int
+		if md.Workflows != nil {
+			connected = md.Workflows.ConnectedWorkers
+		}
+		assert.Equal(c, count, connected)
+	}, time.Second*30, time.Millisecond*10)
+}
+
+func (w *Workflow) ResetRegistry(t *testing.T) {
+	t.Helper()
+	w.taskregistry[0] = task.NewTaskRegistry()
+}
+
+func (w *Workflow) Registry() *task.TaskRegistry {
+	return w.taskregistry[0]
+}
+
+// Registry returns the registry for a specific index
+func (w *Workflow) RegistryN(index int) *task.TaskRegistry {
+	return w.taskregistry[index]
+}
+
+func (w *Workflow) WorkflowClient(t *testing.T, ctx context.Context) *workflow.Client {
+	t.Helper()
+	return workflow.NewClientWithLogger(w.Dapr().GRPCConn(t, ctx), logger.New(t))
+}
+
+func (w *Workflow) WorkflowClientN(t *testing.T, ctx context.Context, index int) *workflow.Client {
+	t.Helper()
+	require.Less(t, index, len(w.daprds), "index out of range")
+	return workflow.NewClientWithLogger(w.DaprN(index).GRPCConn(t, ctx), logger.New(t))
+}
+
+func (w *Workflow) BackendClient(t *testing.T, ctx context.Context) *client.TaskHubGrpcClient {
+	t.Helper()
+
+	return w.BackendClientN(t, ctx, 0)
+}
+
+// BackendClient returns a backend client for the specified index
+func (w *Workflow) BackendClientN(t *testing.T, ctx context.Context, index int) *client.TaskHubGrpcClient {
+	t.Helper()
+	require.Less(t, index, len(w.daprds), "index out of range")
+
+	backendClient := client.NewTaskHubGrpcClient(w.daprds[index].GRPCConn(t, ctx), logger.New(t))
+	require.NoError(t, backendClient.StartWorkItemListener(ctx, w.RegistryN(index)))
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		// GetMetadata can return a partially-populated value if the underlying
+		// HTTP request fails or times out (the request runs under a derived
+		// context with its own deadline). Guard each field access so a nil
+		// here causes the Eventually tick to retry rather than panic the
+		// whole test binary.
+		md := w.DaprN(index).GetMetadata(t, ctx)
+		if !assert.NotNil(c, md) {
+			return
+		}
+		if !assert.NotNil(c, md.ActorRuntime) {
+			return
+		}
+		assert.GreaterOrEqual(c, len(md.ActorRuntime.ActiveActors), 3)
+		if assert.NotNil(c, md.Workflows) {
+			assert.GreaterOrEqual(c, md.Workflows.ConnectedWorkers, 1)
+		}
+	}, time.Second*60, time.Millisecond*10)
+
+	return backendClient
+}
+
+func (w *Workflow) GRPCClient(t *testing.T, ctx context.Context) rtv1.DaprClient {
+	t.Helper()
+	return w.daprds[0].GRPCClient(t, ctx)
+}
+
+// InternalGRPCClient returns a client for the internal gRPC API of the first
+// daprd, authenticated as that daprd's own app when mTLS is enabled. Tests
+// use it to drive the reserved workflow actors directly, as a peer daprd of
+// the same app would.
+func (w *Workflow) InternalGRPCClient(t *testing.T, ctx context.Context) internalv1pb.ServiceInvocationClient {
+	t.Helper()
+	d := w.daprds[0]
+	return d.InternalGRPCClient(t, ctx, w.sentry, d.AppID(), d.Namespace())
+}
+
+// GRPCClientForApp returns a GRPC client for the specified app index
+func (w *Workflow) GRPCClientN(t *testing.T, ctx context.Context, index int) rtv1.DaprClient {
+	t.Helper()
+	require.Less(t, index, len(w.daprds), "index out of range")
+	return w.daprds[index].GRPCClient(t, ctx)
+}
+
+func baseFeatureList(clustered, fastPath, stagedOperations bool) []string {
+	features := make([]string, 0, 3)
+	if clustered {
+		features = append(features, "WorkflowsClusteredDeployment")
+	}
+	if fastPath {
+		features = append(features, "WorkflowsFastPath")
+	}
+	if stagedOperations {
+		features = append(features, "WorkflowsStagedOperations")
+	}
+	return features
+}
+
+// JoinOptions returns the options an extra daprd needs to join this
+// harness's cluster in the same modes: the feature flags and, under mTLS,
+// the Sentry wiring.
+func (w *Workflow) JoinOptions(t *testing.T) []daprd.Option {
+	t.Helper()
+	features := baseFeatureList(w.clustered, w.fastPath, w.stagedOperations)
+	var opts []daprd.Option
+	if w.sentry != nil {
+		opts = append(opts, daprd.WithSentry(t, w.sentry))
+	}
+	if w.signing {
+		features = append(features, "WorkflowHistorySigning")
+	}
+	if len(features) > 0 {
+		opts = append(opts, daprd.WithFeatureEnabled(t, features...))
+	}
+	return opts
+}
+
+// ClusteredDeployment reports whether every daprd in this workflow runs with
+// the WorkflowsClusteredDeployment feature flag enabled. Tests use this to
+// branch assertions which differ between the two modes.
+func (w *Workflow) ClusteredDeployment() bool {
+	return w.clustered
+}
+
+// StagedOperations reports whether every daprd in this workflow runs with
+// the WorkflowsStagedOperations feature flag enabled, except any overridden
+// via WithStagedOperationsN. Tests use this to branch assertions which differ
+// between the two modes.
+func (w *Workflow) StagedOperations() bool {
+	return w.stagedOperations
+}
+
+// SchedulerPlacement reports whether the scheduler serves actor placement
+// for this harness, in which case Placement returns nil.
+func (w *Workflow) SchedulerPlacement() bool {
+	return w.schedulerPlacement
+}
+
+// FastPath reports whether every daprd in this workflow runs with the
+// WorkflowsFastPath feature flag enabled. Tests use this to branch
+// assertions which differ between the two modes.
+func (w *Workflow) FastPath() bool {
+	return w.fastPath
+}
+
+// Signing reports whether this workflow runs with mTLS active and the
+// WorkflowHistorySigning feature flag enabled on its daprds (except any
+// excluded via WithSigningDisabledN). Tests use this to branch assertions
+// which differ when history signing is active.
+func (w *Workflow) Signing() bool {
+	return w.signing
+}
+
+// ActorTypesCount returns the number of actor types a daprd in this workflow
+// registers when a worker is connected: workflow, activity and retentioner,
+// plus the executor rendezvous type in clustered deployment or staged
+// operations mode. It reads the harness-wide modes: a daprd overridden with
+// WithStagedOperationsN may differ.
+func (w *Workflow) ActorTypesCount() int {
+	if w.clustered || w.stagedOperations {
+		return 4
+	}
+	return 3
+}
+
+func (w *Workflow) Dapr() *daprd.Daprd {
+	return w.daprds[0]
+}
+
+func (w *Workflow) DaprN(i int) *daprd.Daprd {
+	return w.daprds[i]
+}
+
+func (w *Workflow) Metrics(t *testing.T, ctx context.Context) map[string]float64 {
+	t.Helper()
+	return w.daprds[0].Metrics(t, ctx).All()
+}
+
+func (w *Workflow) DB() *sqlite.SQLite {
+	return w.db
+}
+
+func (w *Workflow) Scheduler() *scheduler.Scheduler {
+	return w.sched
+}
+
+func (w *Workflow) Sentry() *sentry.Sentry {
+	return w.sentry
+}
+
+// HasPlacement reports whether a standalone placement service runs, rather
+// than placement served by the scheduler.
+func (w *Workflow) HasPlacement() bool {
+	return w.place != nil
+}
+
+// PlacementVersion returns a counter which advances whenever the active
+// placement authority completes a dissemination: the default namespace table
+// version of the placement service, or the scheduler's dissemination count.
+// Only successive values compare, the units differ per authority.
+func (w *Workflow) PlacementVersion(t *testing.T, ctx context.Context) uint64 {
+	if w.place != nil {
+		if table, ok := w.place.PlacementTables(t, ctx).Tables["default"]; ok {
+			return table.Version
+		}
+		return 0
+	}
+	var disseminations float64
+	for k, v := range w.sched.Metrics(t, ctx).All() {
+		if strings.HasPrefix(k, "dapr_scheduler_placement_disseminations_total") {
+			disseminations += v
+		}
+	}
+	return uint64(disseminations)
+}
+
+func (w *Workflow) Placement() *placement.Placement {
+	if w.place == nil {
+		panic("no placement service runs when the scheduler serves placement: pin this suite with workflow.WithPlacementService()")
+	}
+	return w.place
+}

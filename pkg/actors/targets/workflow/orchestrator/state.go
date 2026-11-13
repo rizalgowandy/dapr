@@ -1,0 +1,726 @@
+/*
+Copyright 2025 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package orchestrator
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"sync/atomic"
+	"time"
+
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	contribstate "github.com/dapr/components-contrib/state"
+	actorsapi "github.com/dapr/dapr/pkg/actors/api"
+	"github.com/dapr/dapr/pkg/actors/targets/workflow/common"
+	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
+	internalsv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
+	wfengerrors "github.com/dapr/dapr/pkg/runtime/wfengine/errors"
+	wfenginestate "github.com/dapr/dapr/pkg/runtime/wfengine/state"
+	wferrors "github.com/dapr/dapr/pkg/runtime/wfengine/state/errors"
+	"github.com/dapr/dapr/pkg/runtime/wfengine/todo"
+	"github.com/dapr/durabletask-go/api"
+	"github.com/dapr/durabletask-go/api/protos"
+	"github.com/dapr/durabletask-go/backend"
+	"github.com/dapr/durabletask-go/backend/runtimestate"
+	"github.com/dapr/kit/concurrency"
+)
+
+func (o *orchestrator) stateOptions() wfenginestate.Options {
+	return wfenginestate.Options{
+		AppID:             o.appID,
+		Namespace:         o.namespace,
+		WorkflowActorType: o.actorType,
+		ActivityActorType: o.activityActorType,
+		Signer:            o.signer,
+	}
+}
+
+func (o *orchestrator) loadInternalState(ctx context.Context) (*wfenginestate.State, *backend.WorkflowMetadata, error) {
+	// See if the state for this actor is already cached in memory
+	if o.state != nil {
+		return o.state, o.ometa, nil
+	}
+
+	opts := o.stateOptions()
+
+	// state is not cached, so try to load it from the state store
+	state, err := wfenginestate.LoadWorkflowState(ctx, o.actorState, o.actorID, opts)
+	if err != nil {
+		var verifyErr *wferrors.VerificationError
+		if errors.As(err, &verifyErr) {
+			if state != nil {
+				o.releaseReplacedInstance(state)
+			}
+			if !state.IsCompleted() {
+				return o.tombstoneTamperedState(ctx, opts, state, err)
+			}
+		}
+		return nil, nil, err
+	}
+	o.releaseReplacedInstance(state)
+	if state == nil {
+		// No such state exists in the state store
+		return nil, nil, nil
+	}
+
+	// When signing is enabled, any inbox event that does not match signed
+	// history can only have been written via state store tampering. Treat the
+	// state as unrecoverable: fail the workflow terminally so no further
+	// progress is made on forged input. Skip the scan on an empty inbox as
+	// nothing to validate and the history-index build is pure waste. Skip
+	// when the workflow is already terminal, so we don't re-detect the same
+	// condition on every load.
+	// The unstartable shape (inbox events, empty history, no pending start)
+	// is exempt: with no signed history there is no attestation for inbox
+	// events to violate, and tombstoning it appends a completion without a
+	// start event, masking the terminal status as PENDING. runWorkflow's
+	// unstartable classification fails it terminally instead.
+	if o.signer != nil && len(state.Inbox) > 0 && !state.IsCompleted() && !isUnstartableState(state) {
+		if filtered := filterValidInboxEvents(state); len(filtered) != len(state.Inbox) {
+			cause := fmt.Errorf("workflow actor '%s': inbox contained %d events that did not match signed history (state store tampering)",
+				o.actorID, len(state.Inbox)-len(filtered))
+			return o.tombstoneTamperedState(ctx, opts, state, cause)
+		}
+	}
+
+	// Re-verify any persisted IncomingHistory on cold start. The state store is
+	// not in the trust boundary, and verifySignatureChain only covers
+	// state.History, not the propagated-history key. So an attacker who edits
+	// the persisted propagated-history bytes alone is only caught here. Skip on
+	// terminal workflows for the same reason as inbox-tamper above.
+	// VerifyAndAbsorbPropagatedHistory handles the disabled-signer case
+	// (warns when a signed payload arrives at an unsigned receiver) and
+	// the nil-payload case internally; only the terminal check stays here
+	// to avoid re-tombstoning an already-completed workflow on every load.
+	if state.IncomingHistory != nil && !state.IsCompleted() {
+		if err := o.signing.VerifyAndAbsorbPropagatedHistory(state.IncomingHistory, state); err != nil {
+			cause := fmt.Errorf("workflow actor '%s': persisted propagated history failed verification (state store tampering): %w",
+				o.actorID, err)
+			return o.tombstoneTamperedState(ctx, opts, state, cause)
+		}
+	}
+
+	// Rows a purge on a binary that did not know the keys left behind: a
+	// parent-notify row on a parentless instance, or a creation input from
+	// another creation. Neither is read as this instance's; the next save
+	// drops them.
+	parent := o.getExecutionStartedEvent(state).GetParentInstance()
+	if state.ParentNotifyPending && parent == nil {
+		state.SetParentNotifyPending(false)
+	}
+	if state.CreationInput != nil && !state.CreationInputFor(parent) {
+		state.ClearCreationInput()
+	}
+
+	o.cacheDurable(state)
+
+	return state, o.ometa, nil
+}
+
+// tombstoneTamperedState invokes the signing tombstone path (append
+// tamper marker + delete reminders) and refreshes the orchestrator's
+// cached state/runtime/metadata views with the new failed state.
+func (o *orchestrator) tombstoneTamperedState(ctx context.Context, opts wfenginestate.Options, prior *wfenginestate.State, cause error) (*wfenginestate.State, *backend.WorkflowMetadata, error) {
+	failed, err := o.signing.Tombstone(ctx, o.actorState, opts, prior, cause)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	o.cacheDurable(failed)
+
+	if o.eventSink != nil {
+		o.eventSink(o.ometa)
+	}
+	o.notifyStreams()
+
+	return failed, o.ometa, nil
+}
+
+// notifyStreams pushes the current cached metadata to all registered
+// runtime-status stream watchers and removes any whose condition fired or
+// whose callback errored. Safe to call with no streams registered.
+func (o *orchestrator) notifyStreams() {
+	if len(o.streamFns) == 0 {
+		return
+	}
+	arstate, err := anypb.New(o.ometa)
+	if err != nil {
+		return
+	}
+	streamReq := &internalsv1pb.InternalInvokeResponse{
+		Status:  &internalsv1pb.Status{Code: http.StatusOK},
+		Message: &commonv1pb.InvokeResponse{Data: arstate},
+	}
+	isTerminal := api.WorkflowMetadataIsComplete(o.ometa)
+	for idx, stream := range o.streamFns {
+		if stream.done.Load() {
+			delete(o.streamFns, idx)
+			continue
+		}
+		ok, ferr := stream.fn(streamReq)
+		if ferr != nil || ok || isTerminal {
+			stream.errCh <- ferr
+			delete(o.streamFns, idx)
+		}
+	}
+}
+
+// commitTimeout bounds a state commit that has outlived its caller's context.
+const commitTimeout = 30 * time.Second
+
+// signAndSaveState signs any newly added history events and then persists the
+// state. This is the single entry point for all state persistence; callers
+// must never call saveInternalState directly.
+func (o *orchestrator) signAndSaveState(ctx context.Context, state *wfenginestate.State) error {
+	if err := o.signing.SignNewEvents(state); err != nil {
+		o.invalidateCachedState()
+		return fmt.Errorf("failed to sign new history events: %w", err)
+	}
+	if err := o.saveInternalState(ctx, state); err != nil {
+		o.invalidateCachedState()
+		return err
+	}
+	return nil
+}
+
+func (o *orchestrator) invalidateCachedState() {
+	o.state = nil
+	o.rstate = nil
+	o.ometa = nil
+}
+
+// cacheDurable makes state the cached instance, as the store holds it after
+// a load or a save, and records which instance that is. A state a turn has
+// changed but not yet saved is never cached through here: a save that fails
+// drops the cache, and the load that follows must compare the store with the
+// instance it last held, not with the change that never landed.
+func (o *orchestrator) cacheDurable(state *wfenginestate.State) {
+	o.state = state
+	id := executionIDOf(o.getExecutionStartedEvent(state))
+	o.cachedExecutionID = &id
+	o.primeCachedState(state, o.getExecutionStartedEvent(state))
+}
+
+// releaseReplacedInstance runs on every load from the store. When the store
+// no longer holds the instance the cache last held, because a force purge on
+// another daprd deleted it, or deleted it and another instance was created
+// under the ID, nothing the actor holds for that instance applies to what the
+// store holds, and it is released. The same instance, moved on by another
+// host, keeps it: a result can still be owed to it. loaded is nil when the
+// store holds no instance.
+func (o *orchestrator) releaseReplacedInstance(loaded *wfenginestate.State) {
+	if o.cachedExecutionID == nil {
+		return
+	}
+	if loaded == nil || executionIDOf(o.getExecutionStartedEvent(loaded)) != *o.cachedExecutionID {
+		o.resetForPurgedInstance()
+		o.cachedExecutionID = nil
+	}
+	// The same instance: the record stays until cacheDurable replaces it, so
+	// a load that fails after this point still leaves it in place.
+}
+
+func executionIDOf(es *protos.ExecutionStartedEvent) string {
+	return es.GetWorkflowInstance().GetExecutionId().GetValue()
+}
+
+// primeCachedState rebuilds the cached runtime-state and metadata views from
+// state. startEvent supplies the ExecutionStartedEvent the metadata falls back
+// to when the runtime state carries none of its own. The inverse is
+// invalidateCachedState. Callers set o.state themselves: a caller priming the
+// views for a state that is not yet durable must not cache it.
+func (o *orchestrator) primeCachedState(state *wfenginestate.State, startEvent *protos.ExecutionStartedEvent) {
+	o.rstate = runtimestate.NewWorkflowRuntimeState(o.actorID, state.CustomStatus, resolutionsAfterScheduling(state.History))
+	o.ometa = o.ometaFromState(o.rstate, startEvent)
+}
+
+// confirmCachedState re-reads the metadata row before a message is acked off
+// the cache without a write. A host that lost this actor to a peer would
+// otherwise ack from stale state, where a write would have failed on its
+// etag; a mismatch drops the cache and fails recoverably so the sender
+// retries against a fresh load.
+func (o *orchestrator) confirmCachedState(ctx context.Context, state *wfenginestate.State) error {
+	row, err := o.probeMetadataRow(ctx, state)
+	if err != nil {
+		return wfengerrors.NewRecoverable(fmt.Errorf("failed to confirm the cached state: %w", err))
+	}
+	switch row {
+	case metadataRowMissing:
+		o.invalidateCachedState()
+		return api.ErrInstanceNotFound
+	case metadataRowStale:
+		o.invalidateCachedState()
+		return wfengerrors.NewRecoverable(errors.New("cached state is stale; reloading"))
+	default:
+		return nil
+	}
+}
+
+// rowVerdict is what the store's metadata row says about a cached state.
+type rowVerdict int
+
+const (
+	// metadataRowMatches: the row still describes the cached state.
+	metadataRowMatches rowVerdict = iota
+	// metadataRowMissing: the store holds no row for the instance.
+	metadataRowMissing
+	// metadataRowStale: the row describes a state other than the cached one.
+	metadataRowStale
+)
+
+// probeMetadataRow reads the metadata row, one Get, and compares it with
+// state. What each outcome means is left to the caller.
+func (o *orchestrator) probeMetadataRow(ctx context.Context, state *wfenginestate.State) (rowVerdict, error) {
+	res, err := o.actorState.Get(ctx, &actorsapi.GetStateRequest{
+		ActorType: o.actorType,
+		ActorID:   o.actorID,
+		Key:       wfenginestate.MetadataKey,
+	}, false)
+	if err != nil {
+		return 0, err
+	}
+	if res == nil || len(res.Data) == 0 {
+		return metadataRowMissing, nil
+	}
+	if _, ok := rowMatches(res, state.MetadataETag(), state.Generation, uint64(len(state.History))); !ok {
+		return metadataRowStale, nil
+	}
+	return metadataRowMatches, nil
+}
+
+// loadStateForCreate loads the state a create is judged on. A cached state is
+// first checked against the store's metadata row: a force purge run on another
+// daprd deletes the rows and evicts the actor resident here, but when that
+// eviction does not land (an owner that predates it, or a turn that held the
+// lock past the purge's budget) the actor keeps its cache. Several of the
+// create's verdicts (AlreadyExists, a parent still owed its completion, a
+// retry already committed) return without a save, so the save's ETag guard
+// would never catch the stale cache. A row that no longer describes the cache
+// drops it and reloads from the store; a row that is gone means the instance
+// was purged, so the create starts a new one. A missing row is only trusted
+// once the store has served this instance an ETag: before that it may be a
+// store that does not yet read its own write, and the cache is kept.
+func (o *orchestrator) loadStateForCreate(ctx context.Context) (*wfenginestate.State, error) {
+	cached := o.state != nil
+	state, _, err := o.loadInternalState(ctx)
+	// A fallback host probed the row at the start of this call, in
+	// dropFallbackCache: a cache that survived it was confirmed.
+	if err != nil || !cached || o.isFallback() {
+		return state, err
+	}
+
+	row, err := o.probeMetadataRow(ctx, state)
+	if err != nil {
+		return nil, wfengerrors.NewRecoverable(fmt.Errorf("failed to confirm the cached state: %w", err))
+	}
+	if row == metadataRowMatches || (row == metadataRowMissing && !state.MetadataETagSeen()) {
+		return state, nil
+	}
+
+	log.Debugf("Workflow actor '%s': cached state no longer matches the store; reloading before create", o.actorID)
+	o.invalidateCachedState()
+	state, _, err = o.loadInternalState(ctx)
+	return state, err
+}
+
+// resetForPurgedInstance releases what the actor holds for an instance a
+// force purge on another daprd deleted while the actor stayed resident. The
+// instance is gone, so no result is owed to it: the same release a purge on
+// this host makes once the rows are deleted. A purge on this host also
+// retires the actor, so the next instance starts with the residency state
+// initOrchestrator gives a fresh one; here the actor stays, so reset it: the
+// janitor the purge deleted must be asserted again for the new instance.
+// Called from releaseReplacedInstance only. The caller holds the turn lock.
+func (o *orchestrator) resetForPurgedInstance() {
+	o.activityResultAwaited.Store(false)
+	o.janitorAsserted.Store(false)
+	o.janitorRedispatched = nil
+	o.janitorEscalated = nil
+	// Completions held for the purged instance would be taken by the new
+	// instance's first turn: a new instance starts at generation 1, the
+	// purged one's generation unless it had continued as new.
+	o.foldFlush()
+}
+
+func (o *orchestrator) saveInternalState(ctx context.Context, state *wfenginestate.State) error {
+	// generate and run a state store operation that saves all changes
+	req, err := state.GetSaveRequest(o.actorID)
+	if err != nil {
+		return err
+	}
+
+	log.Debugf("Workflow actor '%s': saving %d keys to actor state store", o.actorID, len(req.Operations))
+
+	// The commit must not be abandoned because the caller's context died. A
+	// turn dispatches its activities BEFORE it saves, so a host-level cancel
+	// (worker disconnect, placement churn, HaltAll) landing between the two
+	// would leave the side effects done and the history unwritten, which
+	// replays as a non-deterministic workflow. Safe because the Multi is
+	// ETag-conditional on the metadata row: a peer that took this actor and
+	// wrote first still wins, with an ETagMismatch handled below.
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
+	defer cancel()
+
+	if err = o.actorState.TransactionalStateOperation(cctx, true, req, false); err != nil {
+		// ETagMismatch means a peer host wrote to this workflow's metadata
+		// row underneath us between our load and this save. The whole Multi
+		// rolled back atomically, so the durable state still reflects the
+		// peer's view; our in-memory state is stale. The caller
+		// (signAndSaveState) handles cache invalidation on any error from
+		// this function; we just classify the error here so the log line
+		// distinguishes peer-write conflicts from real save failures, and
+		// the caller's recoverable-error retry path re-runs the operation
+		// against the updated state on the next firing.
+		var etagErr *contribstate.ETagError
+		if errors.As(err, &etagErr) && etagErr.Kind() == contribstate.ETagMismatch {
+			log.Debugf("Workflow actor '%s': save aborted by peer write (etag mismatch); surfacing for retry", o.actorID)
+		}
+		return err
+	}
+
+	// ResetChangeTracking should always be called after a save operation succeeds
+	state.ResetChangeTracking()
+
+	// The save is durable: the store now holds this state, whatever the
+	// refresh below does with the cache. A ContinueAsNew changed the
+	// execution ID, and a load that follows a dropped cache must compare the
+	// store with it, not with the generation before.
+	id := executionIDOf(o.getExecutionStartedEvent(state))
+	o.cachedExecutionID = &id
+
+	// Refresh the metadata ETag for the next save. Multi does not return new
+	// ETags, so we read just the metadata row back. A read error here is
+	// non-fatal: the persisted save is durable, we just don't know the new
+	// version token; drop the cache and let the next operation reload. An
+	// empty response means the row is gone: a force purge landed and the
+	// cache must not be written back.
+	// TODO: @joshvanl: add etag support to Multi and remove this extra read.
+	metaRes, metaErr := o.actorState.Get(ctx, &actorsapi.GetStateRequest{
+		ActorType: o.actorType,
+		ActorID:   o.actorID,
+		Key:       wfenginestate.MetadataKey,
+	}, false)
+	if metaErr != nil {
+		log.Debugf("Workflow actor '%s': failed to refresh metadata etag after save (%v); next operation will reload", o.actorID, metaErr)
+		o.invalidateCachedState()
+		return nil
+	}
+	switch {
+	case metaRes == nil, len(metaRes.Data) == 0 && !state.MetadataETagSeen():
+		// Unknown version, or a store that does not read its own writes yet
+		// has not served this new instance's row: the next save reloads.
+		state.SetMetadataETag(nil)
+	case len(metaRes.Data) == 0:
+		// The row vanished between the Multi and this read: a force purge
+		// landed, unless the store served a read that lags its own write.
+		// Confirm once before failing the caller so the turn's post-save
+		// effects (parent notification, retention, cascade) do not act on a
+		// purged instance; the refire finds no state. The sentinel sits
+		// last: remote classifiers match by suffix.
+		again, againErr := o.actorState.Get(ctx, &actorsapi.GetStateRequest{
+			ActorType: o.actorType,
+			ActorID:   o.actorID,
+			Key:       wfenginestate.MetadataKey,
+		}, false)
+		if againErr != nil {
+			// Unconfirmed either way: the save is durable, so retry the turn
+			// rather than run its post-save effects on a possibly purged
+			// instance. The refire reloads and finds no state if it was.
+			o.invalidateCachedState()
+			return wfengerrors.NewRecoverable(fmt.Errorf("failed to confirm the metadata row after save: %w", againErr))
+		}
+		if len(again.Data) > 0 {
+			log.Debugf("Workflow actor '%s': metadata row read back empty once after save; the next operation reloads", o.actorID)
+			state.SetMetadataETag(nil)
+			o.invalidateCachedState()
+			return nil
+		}
+		log.Warnf("Workflow actor '%s': metadata row missing after save; the state was purged concurrently", o.actorID)
+		o.invalidateCachedState()
+		o.deactivate(o)
+		return fmt.Errorf("state purged after save: %w", api.ErrInstanceNotFound)
+	default:
+		state.SetMetadataETag(metaRes.ETag)
+	}
+
+	o.cacheDurable(state)
+	if o.eventSink != nil {
+		o.eventSink(o.ometa)
+	}
+	o.notifyStreams()
+
+	return nil
+}
+
+// This method cleans up a workflow associated with the given actorID
+func (o *orchestrator) cleanupWorkflowStateInternal(ctx context.Context, state *wfenginestate.State, includeRetentionReminder bool) error {
+	// Once a purge has been attempted the next load must come from the store,
+	// whatever else failed: the deactivation below is asynchronous and the
+	// actor stays tabled until it runs. Nothing is owed for an instance that
+	// no longer exists either, so the reuse guard goes with the cache: a late
+	// result for the purged instance is judged before this actor is reaped
+	// and would otherwise leave the flag set for the next generation.
+	// The cache goes whatever happened: a purge whose rows landed but whose
+	// reminder deletes failed must not keep serving them. The reuse guard is
+	// different, because it only stops an ID being reused while a result is
+	// still owed: clear it only once the rows are actually gone, or a purge
+	// that failed to delete anything would let a create through while the
+	// instance and its outstanding activity are both still live.
+	var rowsDeleted atomic.Bool
+	defer func() {
+		o.invalidateCachedState()
+		if rowsDeleted.Load() {
+			o.activityResultAwaited.Store(false)
+		}
+	}()
+
+	// This will create a request to purge everything.
+	req, err := state.GetPurgeRequest(o.actorID)
+	if err != nil {
+		return err
+	}
+
+	runners := []concurrency.Runner{
+		func(ctx context.Context) error {
+			// This will do the purging
+			if terr := o.actorState.TransactionalStateOperation(ctx, true, req, false); terr != nil {
+				return terr
+			}
+			rowsDeleted.Store(true)
+			return nil
+		},
+		func(ctx context.Context) error {
+			return common.DeleteRemindersWithRetry(ctx, o.reminders, &actorsapi.DeleteRemindersByActorIDRequest{
+				ActorType:       o.actorType,
+				ActorID:         o.actorID,
+				MatchIDAsPrefix: false,
+			})
+		},
+		func(ctx context.Context) error {
+			return common.DeleteRemindersWithRetry(ctx, o.reminders, &actorsapi.DeleteRemindersByActorIDRequest{
+				ActorType:       o.activityActorType,
+				ActorID:         o.actorID + "::",
+				MatchIDAsPrefix: true,
+			})
+		},
+	}
+
+	if includeRetentionReminder {
+		runners = append(runners, func(ctx context.Context) error {
+			return common.DeleteRemindersWithRetry(ctx, o.reminders, &actorsapi.DeleteRemindersByActorIDRequest{
+				ActorType:       o.retentionActorType,
+				ActorID:         o.actorID,
+				MatchIDAsPrefix: false,
+			})
+		})
+	}
+
+	if err = concurrency.Join(ctx, runners...); err != nil {
+		return err
+	}
+
+	o.deactivate(o)
+
+	return nil
+}
+
+func (o *orchestrator) ometaFromState(rstate *backend.WorkflowRuntimeState, startEvent *protos.ExecutionStartedEvent) *backend.WorkflowMetadata {
+	var se *protos.ExecutionStartedEvent = nil
+	if rstate.GetStartEvent() != nil {
+		se = rstate.GetStartEvent()
+	} else if startEvent != nil {
+		se = startEvent
+	}
+
+	name, _ := runtimestate.Name(rstate)
+	if name == "" && se != nil {
+		name = se.GetName()
+	}
+	createdAt, _ := runtimestate.CreatedTime(rstate)
+	lastUpdated, _ := runtimestate.LastUpdatedTime(rstate)
+	completedAt, _ := runtimestate.CompletedTime(rstate)
+	input, _ := runtimestate.Input(rstate)
+	output, _ := runtimestate.Output(rstate)
+	failureDetails, _ := runtimestate.FailureDetails(rstate)
+	var parentInstanceID string
+	var parentAppID *wrapperspb.StringValue
+	if se != nil && se.GetParentInstance() != nil && se.GetParentInstance().GetWorkflowInstance() != nil {
+		parentInstanceID = se.GetParentInstance().GetWorkflowInstance().GetInstanceId()
+		if se.GetParentInstance().GetAppID() != "" {
+			parentAppID = wrapperspb.String(se.GetParentInstance().GetAppID())
+		}
+	}
+	var startedAt *timestamppb.Timestamp
+	if t := runtimestate.GetStartedTime(rstate); !t.IsZero() {
+		startedAt = timestamppb.New(t)
+	}
+
+	return &backend.WorkflowMetadata{
+		InstanceId:       rstate.GetInstanceId(),
+		Name:             name,
+		RuntimeStatus:    runtimestate.RuntimeStatus(rstate),
+		CreatedAt:        timestamppb.New(createdAt),
+		LastUpdatedAt:    timestamppb.New(lastUpdated),
+		CompletedAt:      timestamppb.New(completedAt),
+		Input:            input,
+		Output:           output,
+		CustomStatus:     rstate.GetCustomStatus(),
+		FailureDetails:   failureDetails,
+		ParentInstanceId: parentInstanceID,
+		ParentAppId:      parentAppID,
+		Version:          wfenginestate.WorkflowVersion(rstate.GetOldEvents()),
+		StartedAt:        startedAt,
+	}
+}
+
+// This method purges all the completed activity data from a workflow associated with the given actorID
+func (o *orchestrator) purgeWorkflowState(ctx context.Context, meta map[string]*internalsv1pb.ListStringValue) error {
+	defer o.deactivate(o)
+
+	log.Debugf("Workflow actor '%s': purging workflow state", o.actorID)
+
+	state, _, err := o.loadInternalState(ctx)
+	if err != nil {
+		return err
+	}
+	if state == nil {
+		return api.ErrInstanceNotFound
+	}
+
+	if o.rstate.Stalled != nil {
+		return api.ErrStalled
+	}
+
+	// If the workflow is required to complete but it's not yet completed then
+	// return [ErrNotCompleted] This check is used by purging workflow
+	// A completion the parent has not acknowledged is not finished: purging
+	// it would lose the notification.
+	if !runtimestate.IsCompleted(o.rstate) || state.ParentNotifyPending {
+		return api.ErrNotCompleted
+	}
+
+	s, ok := meta[todo.MetadataPurgeRetentionCall]
+	retentionCall := ok && len(s.GetValues()) > 0 && s.GetValues()[0] == "true"
+
+	return o.cleanupWorkflowStateInternal(ctx, state, !retentionCall)
+}
+
+func (o *orchestrator) getExecutionStartedEvent(state *wfenginestate.State) *protos.ExecutionStartedEvent {
+	for _, e := range state.History {
+		if es := e.GetExecutionStarted(); es != nil {
+			return es
+		}
+	}
+	for _, e := range state.Inbox {
+		if es := e.GetExecutionStarted(); es != nil {
+			return es
+		}
+	}
+	return &protos.ExecutionStartedEvent{}
+}
+
+// cachedInboxCurrent reports whether the store agrees with the cached state
+// that nothing waits in the inbox: its metadata row (one read, not the whole
+// history) describes the cached state and holds an empty inbox. A cache or a
+// row without an ETag cannot be confirmed.
+func (o *orchestrator) cachedInboxCurrent(ctx context.Context, state *wfenginestate.State) (bool, error) {
+	if state.MetadataETag() == nil {
+		return false, nil
+	}
+	res, err := o.actorState.Get(ctx, &actorsapi.GetStateRequest{
+		ActorType: o.actorType,
+		ActorID:   o.actorID,
+		Key:       wfenginestate.MetadataKey,
+	}, false)
+	if err != nil {
+		return false, err
+	}
+	return rowShowsEmptyInbox(res, state.MetadataETag(), state.Generation, uint64(len(state.History))), nil
+}
+
+// rowShowsEmptyInbox reports whether a metadata row read from the store has
+// the given ETag, generation and history length and an empty inbox. A missing
+// row, or one without an ETag, cannot be confirmed.
+func rowShowsEmptyInbox(res *actorsapi.StateResponse, etag *string, generation, historyLength uint64) bool {
+	if res == nil || len(res.Data) == 0 || res.ETag == nil {
+		return false
+	}
+	meta, ok := rowMatches(res, etag, generation, historyLength)
+	return ok && meta.GetInboxLength() == 0
+}
+
+// rowMatches reports whether a metadata row read from the store has the given
+// generation and history length, and the given ETag when both carry one. The
+// ETag alone is not enough: the post-save refresh can record a peer's newer
+// ETag, and some stores restart a row's version when the row is recreated. An
+// unreadable row does not match.
+func rowMatches(res *actorsapi.StateResponse, etag *string, generation, historyLength uint64) (*backend.BackendWorkflowStateMetadata, bool) {
+	if cur := res.ETag; cur != nil && etag != nil && *cur != *etag {
+		return nil, false
+	}
+	var meta backend.BackendWorkflowStateMetadata
+	if err := proto.Unmarshal(res.Data, &meta); err != nil {
+		return nil, false
+	}
+	return &meta, meta.GetGeneration() == generation && meta.GetHistoryLength() == historyLength
+}
+
+// settledTerminal stands in for the history a completed instance releases:
+// its metadata row as this host read it when it last loaded the instance
+// whole and found nothing owed. A fan-out completed in one turn leaves one
+// wake-up per result behind, and each would otherwise reload every history
+// row under the actor lock.
+type settledTerminal struct {
+	etag          string
+	generation    uint64
+	historyLength uint64
+	// firstRow is the stored first history row: the WorkflowStarted of the
+	// execution's first turn, stamped with that turn's time. A recreated
+	// execution writes its own, so it differs even where the metadata row
+	// repeats.
+	firstRow []byte
+}
+
+// settledUnchanged reports whether the store still holds the instance
+// o.settled was taken from, with nothing in its inbox and no notification
+// owed to a parent. Every save rewrites the metadata row, so any write since
+// changes its ETag. A store that restarts a recreated row's version can
+// repeat the ETag, generation and history length, so the first history row is
+// compared too, and the parent-notify row is read so that an owed
+// notification is always sent. All three rows come in one read.
+func (o *orchestrator) settledUnchanged(ctx context.Context) (bool, error) {
+	res, err := o.actorState.GetBulk(ctx, &actorsapi.GetBulkStateRequest{
+		ActorType: o.actorType,
+		ActorID:   o.actorID,
+		Keys:      []string{wfenginestate.MetadataKey, wfenginestate.ParentNotifyKey, wfenginestate.HistoryKey(0)},
+	}, false)
+	if err != nil {
+		return false, err
+	}
+	if pn := res[wfenginestate.ParentNotifyKey]; len(pn.Data) > 0 || pn.ETag != nil {
+		return false, nil
+	}
+	if !bytes.Equal(res[wfenginestate.HistoryKey(0)].Data, o.settled.firstRow) {
+		return false, nil
+	}
+	md := res[wfenginestate.MetadataKey]
+	return rowShowsEmptyInbox(&actorsapi.StateResponse{Data: md.Data, ETag: md.ETag}, &o.settled.etag, o.settled.generation, o.settled.historyLength), nil
+}

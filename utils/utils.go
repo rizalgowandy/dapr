@@ -1,113 +1,151 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package utils
 
 import (
-	"flag"
 	"fmt"
-	"path/filepath"
+	"io/fs"
+	"maps"
+	"os"
+	"slices"
 	"strings"
-	"time"
-
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/homedir"
 )
 
-var clientSet *kubernetes.Clientset
-var kubeConfig *rest.Config
+const (
+	DotDelimiter = "."
+)
 
-func initKubeConfig() {
-	kubeConfig = GetConfig()
-	clientset, err := kubernetes.NewForConfig(kubeConfig)
-	if err != nil {
-		panic(err)
-	}
-
-	clientSet = clientset
+// Contains reports whether v is present in s.
+// Similar to https://pkg.go.dev/golang.org/x/exp/slices#Contains.
+func Contains[T comparable](s []T, v T) bool {
+	return slices.Contains(s, v)
 }
 
-// GetConfig gets a kubernetes rest config
-func GetConfig() *rest.Config {
-	if kubeConfig != nil {
-		return kubeConfig
-	}
-
-	var kubeconfig *string
-	if home := homedir.HomeDir(); home != "" {
-		kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
-	} else {
-		kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
-	}
-	flag.Parse()
-
-	conf, err := rest.InClusterConfig()
-	if err != nil {
-		conf, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	return conf
-}
-
-// GetKubeClient gets a kubernetes client
-func GetKubeClient() *kubernetes.Clientset {
-	if clientSet == nil {
-		initKubeConfig()
-	}
-
-	return clientSet
-}
-
-// ToISO8601DateTimeString converts dateTime to ISO8601 Format
-// ISO8601 Format: 2020-01-01T01:01:01.10101Z
-func ToISO8601DateTimeString(dateTime time.Time) string {
-	t := dateTime.UTC()
-
-	year, month, day := t.Date()
-	hour, minute, second := t.Clock()
-	micros := t.Nanosecond() / 1000
-
-	return fmt.Sprintf(
-		"%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-		year, month, day, hour, minute, second, micros)
-}
-
-// add env-vars from annotations.
-// see https://github.com/dapr/dapr/issues/2508.
-func ParseEnvString(envStr string) []corev1.EnvVar {
-	envVars := make([]corev1.EnvVar, 0)
-	envPairs := strings.Split(envStr, ",")
-
-	for _, value := range envPairs {
-		pair := strings.Split(strings.TrimSpace(value), "=")
-
-		if len(pair) != 2 {
-			continue
-		}
-
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  pair[0],
-			Value: pair[1],
-		})
-	}
-
-	return envVars
-}
-
-// StringSliceContains return true if an array containe the "str" string
-func StringSliceContains(needle string, haystack []string) bool {
-	for _, item := range haystack {
-		if item == needle {
+// ContainsPrefixed reports whether v is prefixed by any of the strings in s.
+func ContainsPrefixed(prefixes []string, v string) bool {
+	for _, e := range prefixes {
+		if strings.HasPrefix(v, e) {
 			return true
 		}
 	}
 	return false
+}
+
+// SetEnvVariables set variables to environment.
+func SetEnvVariables(variables map[string]string) error {
+	for key, value := range variables {
+		err := os.Setenv(key, value)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GetEnvOrElse get the value from the OS environment or use the else value if variable is not present.
+func GetEnvOrElse(name, orElse string) string {
+	if value, ok := os.LookupEnv(name); ok {
+		return value
+	}
+	return orElse
+}
+
+// GetIntValOrDefault returns an int value if greater than 0 OR default value.
+func GetIntValOrDefault(val int, defaultValue int) int {
+	if val > 0 {
+		return val
+	}
+	return defaultValue
+}
+
+// IsSocket returns if the given file is a unix socket.
+func IsSocket(f fs.FileInfo) bool {
+	return f.Mode()&fs.ModeSocket != 0
+}
+
+// SocketExists returns true if the file in that path is an unix socket.
+func SocketExists(socketPath string) bool {
+	if s, err := os.Stat(socketPath); err == nil {
+		return IsSocket(s)
+	}
+	return false
+}
+
+func PopulateMetadataForBulkPublishEntry(reqMeta, entryMeta map[string]string) map[string]string {
+	resMeta := map[string]string{}
+	maps.Copy(resMeta, entryMeta)
+	for k, v := range reqMeta {
+		if _, ok := resMeta[k]; !ok {
+			// Populate only metadata key that is already not present in the entry level metadata map
+			resMeta[k] = v
+		}
+	}
+
+	return resMeta
+}
+
+// Filter returns a new slice containing all items in the given slice that satisfy the given test.
+func Filter[T any](items []T, test func(item T) bool) []T {
+	filteredItems := make([]T, len(items))
+	n := 0
+	for i := range items {
+		if test(items[i]) {
+			filteredItems[n] = items[i]
+			n++
+		}
+	}
+	return filteredItems[:n]
+}
+
+// MapToSlice is the inversion of SliceToMap. Order is not guaranteed as map retrieval order is not.
+func MapToSlice[T comparable, V any](m map[T]V) []T {
+	l := make([]T, len(m))
+	var i int
+	for uid := range m {
+		l[i] = uid
+		i++
+	}
+	return l
+}
+
+const (
+	logNameFmt        = "%s (%s)"
+	logNameVersionFmt = "%s (%s/%s)"
+)
+
+// ComponentLogName returns the name of a component that can be used in logging.
+func ComponentLogName(name, typ, version string) string {
+	if version == "" {
+		return fmt.Sprintf(logNameFmt, name, typ)
+	}
+
+	return fmt.Sprintf(logNameVersionFmt, name, typ, version)
+}
+
+// GetNamespaceOrDefault returns the namespace for Dapr, or the default namespace if it is not set.
+func GetNamespaceOrDefault(defaultNamespace string) string {
+	namespace := os.Getenv("NAMESPACE")
+	if namespace == "" {
+		namespace = defaultNamespace
+	}
+	return namespace
+}
+
+func ParseServiceAddr(val string) []string {
+	p := strings.Split(val, ",")
+	for i, v := range p {
+		p[i] = strings.TrimSpace(v)
+	}
+	return p
 }

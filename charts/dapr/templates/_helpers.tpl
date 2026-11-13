@@ -30,3 +30,40 @@ Create chart name and version as used by the chart label.
 {{- define "k8s_operator.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
+
+{{/*
+Formats imagePullSecrets. Input is dict( "imagePullSecrets" .{specific imagePullSecrets}).
+*/}}
+{{- define "dapr.imagePullSecrets" -}}
+{{- if eq (typeOf .imagePullSecrets) "string" -}} {{- /* Single string value */ -}}
+- name: {{ .imagePullSecrets }}
+{{- else -}} {{- /* Not a string value, iterate */ -}}
+{{- range .imagePullSecrets -}}
+{{- if eq (typeOf .) "map[string]interface {}" -}} {{- /* k8s style */ -}}
+- {{ toYaml (dict "name" .name) | trim }}
+{{ else }} {{- /* helm style */ -}}
+- name: {{ . }}
+{{ end }} {{- /* End of inner if */ -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validates podAntiAffinityPolicy is one of the allowed values.
+*/}}
+{{- define "dapr.validatePodAntiAffinityPolicy" -}}
+{{- if not (or (eq .Values.global.ha.podAntiAffinityPolicy "preferredDuringSchedulingIgnoredDuringExecution") (eq .Values.global.ha.podAntiAffinityPolicy "requiredDuringSchedulingIgnoredDuringExecution")) -}}
+{{- fail "global.ha.podAntiAffinityPolicy must be either 'preferredDuringSchedulingIgnoredDuringExecution' or 'requiredDuringSchedulingIgnoredDuringExecution'" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Returns "true" when actor placement is served by the Scheduler, else "false".
+global.scheduler.placement is absent from values of releases installed before
+1.19, which helm upgrade --reuse-values renders without the new chart defaults.
+*/}}
+{{- define "dapr.schedulerPlacementEnabled" -}}
+{{- $scheduler := .Values.global.scheduler | default dict -}}
+{{- $placement := $scheduler.placement | default dict -}}
+{{- $placement.enabled | default false | toString -}}
+{{- end -}}

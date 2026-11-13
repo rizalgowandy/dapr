@@ -1,0 +1,617 @@
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package resiliency
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/cenkalti/backoff/v4"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	resiliencyV1alpha "github.com/dapr/dapr/pkg/apis/resiliency/v1alpha1"
+	"github.com/dapr/dapr/pkg/resiliency/breaker"
+	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/retry"
+)
+
+var testLog = logger.NewLogger("dapr.resiliency.test")
+
+// Example of using NewRunnerWithOptions with an Accumulator function
+func ExampleNewRunnerWithOptions_accumulator() {
+	// Example polocy definition
+	policyDef := &PolicyDefinition{
+		log:  testLog,
+		name: "retry",
+		t:    10 * time.Millisecond,
+		r:    NewRetry(retry.Config{MaxRetries: 6}, NewRetryConditionMatch()),
+	}
+
+	// Handler function
+	val := atomic.Int32{}
+	fn := func(ctx context.Context) (int32, error) {
+		v := val.Add(1)
+		// When the value is "2", we outlast the timeout
+		// As a consequence, the accumulator is not called, so the value "2" should not be included in the result
+		// Waiting on the attempt's own deadline rather than sleeping a fixed
+		// time keeps this independent of how late a coarse timer fires; the
+		// margin after it only has to cover the runner observing the deadline
+		if v == 2 {
+			<-ctx.Done()
+			time.Sleep(100 * time.Millisecond)
+		}
+		// Make this method be executed 4 times in total
+		if v <= 3 {
+			return v, errors.New("continue")
+		}
+		return v, nil
+	}
+
+	// Invoke the policy and collect all received values
+	received := []int32{}
+	policy := NewRunnerWithOptions(context.Background(), policyDef, RunnerOpts[int32]{
+		Accumulator: func(i int32) {
+			// Safe to use non-atomic operations in the next line because "received" is not used in the operation function ("fn")
+			received = append(received, i)
+		},
+	})
+
+	// When using accumulators, the result only contains the last value and is normally ignored
+	res, err := policy(fn)
+
+	fmt.Println(res, err, received)
+	// Output: 4 <nil> [1 3 4]
+}
+
+// Example of using NewRunnerWithOptions with a Disposer function
+func ExampleNewRunnerWithOptions_disposer() {
+	// Example polocy definition
+	policyDef := &PolicyDefinition{
+		log:  testLog,
+		name: "retry",
+		t:    10 * time.Millisecond,
+		r:    NewRetry(retry.Config{MaxRetries: 6}, NewRetryConditionMatch()),
+	}
+
+	// Handler function
+	counter := atomic.Int32{}
+	fn := func(ctx context.Context) (int32, error) {
+		v := counter.Add(1)
+		// When the value is "2", we add a sleep that will trip the timeout
+		if v == 2 {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if v <= 3 {
+			return v, errors.New("continue")
+		}
+		return v, nil
+	}
+
+	// Invoke the policy and collect all disposed values
+	disposerCalled := make(chan int32, 5)
+	policy := NewRunnerWithOptions(context.Background(), policyDef, RunnerOpts[int32]{
+		Disposer: func(val int32) {
+			// Dispose the object as needed, for example calling things like:
+			// val.Close()
+
+			// Use a buffered channel here because the disposer method should not block
+			disposerCalled <- val
+		},
+	})
+
+	// Execute the policy
+	res, err := policy(fn)
+
+	// The disposer should be 3 times called with values 1, 2, 3
+	disposed := make([]int32, 0, 3)
+	for range 3 {
+		disposed = append(disposed, <-disposerCalled)
+	}
+	slices.Sort(disposed)
+
+	fmt.Println(res, err, disposed)
+	// Output: 4 <nil> [1 2 3]
+}
+
+func TestPolicy(t *testing.T) {
+	retryValue := retry.DefaultConfig()
+	cbValue := breaker.CircuitBreaker{
+		Name:     "test",
+		Interval: 10 * time.Millisecond,
+		Timeout:  10 * time.Millisecond,
+	}
+	cbValue.Initialize(testLog)
+	tests := map[string]*struct {
+		t  time.Duration
+		r  *Retry
+		cb *breaker.CircuitBreaker
+	}{
+		"empty": {},
+		"all": {
+			t:  10 * time.Millisecond,
+			r:  NewRetry(retryValue, NewRetryConditionMatch()),
+			cb: &cbValue,
+		},
+		"nil policy": nil,
+	}
+
+	ctx := t.Context()
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			called := atomic.Bool{}
+			fn := func(ctx context.Context) (any, error) {
+				called.Store(true)
+				return nil, nil
+			}
+			var policyDef *PolicyDefinition
+			if tt != nil {
+				policyDef = &PolicyDefinition{
+					log:  testLog,
+					name: name,
+					t:    tt.t,
+					r:    tt.r,
+					cb:   tt.cb,
+				}
+			}
+			policy := NewRunner[any](ctx, policyDef)
+			policy(fn)
+			assert.True(t, called.Load())
+		})
+	}
+}
+
+func TestPolicyTimeout(t *testing.T) {
+	tests := []struct {
+		name      string
+		sleepTime time.Duration
+		timeout   time.Duration
+		expected  bool
+	}{
+		{
+			name:      "Timeout expires",
+			sleepTime: time.Millisecond * 100,
+			timeout:   time.Millisecond * 10,
+			expected:  false,
+		},
+		{
+			name:      "Timeout OK",
+			sleepTime: time.Millisecond * 10,
+			timeout:   time.Millisecond * 100,
+			expected:  true,
+		},
+	}
+
+	for i := range tests {
+		test := tests[i]
+		t.Run(test.name, func(t *testing.T) {
+			called := atomic.Bool{}
+			fn := func(ctx context.Context) (any, error) {
+				time.Sleep(test.sleepTime)
+				called.Store(true)
+				return nil, nil
+			}
+
+			policy := NewRunner[any](t.Context(), &PolicyDefinition{
+				log:  testLog,
+				name: "timeout",
+				t:    test.timeout,
+			})
+			policy(fn)
+
+			assert.Equal(t, test.expected, called.Load())
+		})
+	}
+}
+
+func TestPolicyRetry(t *testing.T) {
+	tests := []struct {
+		name       string
+		maxCalls   int32
+		maxRetries int64
+		expected   int32
+	}{
+		{
+			name:       "Retries succeed",
+			maxCalls:   5,
+			maxRetries: 6,
+			expected:   6,
+		},
+		{
+			name:       "Retries fail",
+			maxCalls:   5,
+			maxRetries: 2,
+			expected:   3,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := atomic.Int32{}
+			maxCalls := test.maxCalls
+			fn := func(ctx context.Context) (struct{}, error) {
+				v := called.Add(1)
+				attempt := GetAttempt(ctx)
+				if attempt != v {
+					return struct{}{}, backoff.Permanent(fmt.Errorf("expected attempt in context to be %d but got %d", v, attempt))
+				}
+				if v <= maxCalls {
+					return struct{}{}, fmt.Errorf("called (%d) vs Max (%d)", v-1, maxCalls)
+				}
+				return struct{}{}, nil
+			}
+
+			policy := NewRunner[struct{}](t.Context(), &PolicyDefinition{
+				log:  testLog,
+				name: "retry",
+				t:    10 * time.Millisecond,
+				r:    NewRetry(retry.Config{MaxRetries: test.maxRetries}, NewRetryConditionMatch()),
+			})
+			_, err := policy(fn)
+			if err != nil {
+				assert.NotContains(t, err.Error(), "expected attempt in context to be")
+			}
+			assert.Equal(t, test.expected, called.Load())
+		})
+	}
+}
+
+func TestTimeoutError(t *testing.T) {
+	// The status a proxied gRPC call fails with once its context is
+	// cancelled, which pkg/api/grpc/proxy wraps for retry matching.
+	statusErr := NewCodeError(int32(codes.DeadlineExceeded), status.Error(codes.DeadlineExceeded, "deadline exceeded"))
+
+	expired, cancel := context.WithTimeout(t.Context(), time.Nanosecond)
+	defer cancel()
+	<-expired.Done()
+
+	require.ErrorIs(t, timeoutError(expired, statusErr), context.DeadlineExceeded, "an error returned after the deadline is the timeout")
+	require.ErrorIs(t, timeoutError(expired, errors.New("any")), context.DeadlineExceeded)
+	require.NoError(t, timeoutError(expired, nil), "a result returned as the deadline passes is still a result")
+	require.NoError(t, timeoutError(t.Context(), statusErr), "an error before the deadline is the operation's own")
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, timeoutError(cancelled, statusErr), context.Canceled, "a cancelled attempt reports its cancellation")
+
+	// The deadline has passed on the clock but the timer which cancels the
+	// context has not run yet: a downstream enforcing the same deadline
+	// answers in this gap.
+	stale := staleDeadline{Context: t.Context(), deadline: time.Now().Add(-time.Millisecond)}
+	require.ErrorIs(t, timeoutError(stale, statusErr), context.DeadlineExceeded, "an error after the deadline instant is the timeout")
+	require.NoError(t, timeoutError(stale, nil))
+	due := staleDeadline{Context: t.Context(), deadline: time.Now().Add(time.Minute)}
+	require.NoError(t, timeoutError(due, statusErr), "an error well before the deadline is the operation's own")
+
+	// On Windows the clock can still read before the deadline when a
+	// downstream enforcing the propagated deadline answers.
+	near := staleDeadline{Context: t.Context(), deadline: time.Now().Add(deadlineClockTolerance / 2)}
+	require.ErrorIs(t, timeoutError(near, statusErr), context.DeadlineExceeded, "a gRPC DeadlineExceeded within the clock tolerance is the timeout")
+	canceledErr := NewCodeError(int32(codes.Canceled), status.Error(codes.Canceled, "stream terminated by RST_STREAM with error code: CANCEL"))
+	require.ErrorIs(t, timeoutError(near, canceledErr), context.DeadlineExceeded, "a gRPC Canceled within the clock tolerance is the timeout")
+	require.NoError(t, timeoutError(due, canceledErr), "a gRPC Canceled well before the deadline is the operation's own")
+	unavailableErr := NewCodeError(int32(codes.Unavailable), status.Error(codes.Unavailable, "unavailable"))
+	require.NoError(t, timeoutError(near, unavailableErr), "other codes within the clock tolerance are the operation's own")
+	require.NoError(t, timeoutError(near, errors.New("any")))
+}
+
+type staleDeadline struct {
+	context.Context
+	deadline time.Time
+}
+
+func (s staleDeadline) Deadline() (time.Time, bool) {
+	return s.deadline, true
+}
+
+func TestPolicyRetryWithMatch(t *testing.T) {
+	tests := []struct {
+		name         string
+		maxCalls     int32
+		returnedCode int32
+		matching     *resiliencyV1alpha.RetryMatching
+		maxRetries   int64
+		expected     int32
+	}{
+		{
+			name:         "Retries succeed",
+			maxCalls:     5,
+			returnedCode: 500,
+			matching: &resiliencyV1alpha.RetryMatching{
+				HTTPStatusCodes: "500-599",
+				GRPCStatusCodes: "",
+			},
+			maxRetries: 6,
+			expected:   6,
+		},
+		{
+			name:         "Retries code not in retry list",
+			maxCalls:     5,
+			returnedCode: 500,
+			matching: &resiliencyV1alpha.RetryMatching{
+				HTTPStatusCodes: "400-499",
+				GRPCStatusCodes: "",
+			},
+			maxRetries: 6,
+			expected:   1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := atomic.Int32{}
+			maxCalls := test.maxCalls
+			fn := func(ctx context.Context) (struct{}, error) {
+				v := called.Add(1)
+				attempt := GetAttempt(ctx)
+				if attempt != v {
+					return struct{}{}, backoff.Permanent(fmt.Errorf("expected attempt in context to be %d but got %d", v, attempt))
+				}
+				if v <= maxCalls {
+					return struct{}{}, NewCodeError(test.returnedCode, fmt.Errorf("called (%d) vs Max (%d)", v-1, maxCalls))
+				}
+				return struct{}{}, nil
+			}
+
+			match, err := ParseRetryConditionMatch(test.matching)
+			require.NoError(t, err)
+			policy := NewRunner[struct{}](t.Context(), &PolicyDefinition{
+				log:  testLog,
+				name: "retry",
+				t:    10 * time.Millisecond,
+				r:    NewRetry(retry.Config{MaxRetries: test.maxRetries}, match),
+			})
+			_, err = policy(fn)
+			if err != nil {
+				assert.NotContains(t, err.Error(), "expected attempt in context to be")
+			}
+			assert.Equal(t, test.expected, called.Load())
+		})
+	}
+}
+
+func TestPolicyRetryWithMatchDeadlineExceeded(t *testing.T) {
+	match, err := ParseRetryConditionMatch(&resiliencyV1alpha.RetryMatching{GRPCStatusCodes: "2"})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		// wait returns how long the first attempt waits before failing with
+		// code, given the time left until its deadline.
+		wait     func(left time.Duration) time.Duration
+		code     codes.Code
+		expected int32
+	}{
+		{
+			name:     "app DeadlineExceeded well before the deadline is not retried",
+			wait:     func(time.Duration) time.Duration { return 0 },
+			code:     codes.DeadlineExceeded,
+			expected: 1,
+		},
+		{
+			name: "DeadlineExceeded within the clock tolerance is retried as the timeout",
+			wait: func(left time.Duration) time.Duration {
+				return left - deadlineClockTolerance/2
+			},
+			code:     codes.DeadlineExceeded,
+			expected: 2,
+		},
+		{
+			name:     "app Canceled well before the deadline is not retried",
+			wait:     func(time.Duration) time.Duration { return 0 },
+			code:     codes.Canceled,
+			expected: 1,
+		},
+		{
+			name: "Canceled within the clock tolerance is retried as the timeout",
+			wait: func(left time.Duration) time.Duration {
+				return left - deadlineClockTolerance/2
+			},
+			code:     codes.Canceled,
+			expected: 2,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := atomic.Int32{}
+			fn := func(ctx context.Context) (struct{}, error) {
+				if called.Add(1) > 1 {
+					return struct{}{}, nil
+				}
+				deadline, _ := ctx.Deadline()
+				time.Sleep(test.wait(time.Until(deadline)))
+				//nolint:gosec
+				return struct{}{}, NewCodeError(int32(test.code), status.Error(test.code, "attempt failed"))
+			}
+
+			policy := NewRunner[struct{}](t.Context(), &PolicyDefinition{
+				log:  testLog,
+				name: "retry",
+				t:    200 * time.Millisecond,
+				r:    NewRetry(retry.Config{Policy: retry.PolicyConstant, Duration: time.Millisecond, MaxRetries: 5}, match),
+			})
+			_, _ = policy(fn)
+			assert.Equal(t, test.expected, called.Load())
+		})
+	}
+}
+
+func TestPolicyAccumulator(t *testing.T) {
+	val := atomic.Int32{}
+	fnCalled := atomic.Int32{}
+	fn := func(ctx context.Context) (int32, error) {
+		fnCalled.Add(1)
+		v := val.Load()
+		if v == 0 || v == 2 {
+			// Because the accumulator isn't called when "val" is 0 or 2, we need to increment "val" here
+			val.Add(1)
+		}
+		// When the value is "2", we add a sleep that will trip the timeout
+		// As a consequence, the accumulator is not called, so the value "2" should not be included in the result
+		if v == 2 {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if v <= 3 {
+			return v, errors.New("continue")
+		}
+		return v, nil
+	}
+
+	received := []int32{}
+	policyDef := &PolicyDefinition{
+		log:  testLog,
+		name: "retry",
+		t:    10 * time.Millisecond,
+		r:    NewRetry(retry.Config{MaxRetries: 6}, NewRetryConditionMatch()),
+	}
+	var accumulatorCalled int
+	policy := NewRunnerWithOptions(t.Context(), policyDef, RunnerOpts[int32]{
+		Accumulator: func(i int32) {
+			// Only reason for incrementing "val" here is to have something to check for race conditions with "go test -race"
+			val.Add(1)
+			// Safe to use non-atomic operations in the next line because "received" is not used in the operation function ("fn")
+			received = append(received, i)
+			accumulatorCalled++
+		},
+	})
+	res, err := policy(fn)
+
+	// Sleep a bit to ensure that things in the background aren't continuing
+	time.Sleep(100 * time.Millisecond)
+
+	require.NoError(t, err)
+	// res should contain only the last result, i.e. 4
+	assert.Equal(t, int32(4), res)
+	assert.Equal(t, 3, accumulatorCalled)
+	assert.Equal(t, int32(5), fnCalled.Load())
+	assert.Equal(t, []int32{1, 3, 4}, received)
+}
+
+func TestPolicyDisposer(t *testing.T) {
+	counter := atomic.Int32{}
+	fn := func(ctx context.Context) (int32, error) {
+		v := counter.Add(1)
+		// When the value is "2", we add a sleep that will trip the timeout
+		if v == 2 {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if v <= 3 {
+			return v, errors.New("continue")
+		}
+		return v, nil
+	}
+
+	disposerCalled := make(chan int32, 5)
+	policyDef := &PolicyDefinition{
+		log:  testLog,
+		name: "retry",
+		t:    10 * time.Millisecond,
+		r:    NewRetry(retry.Config{MaxRetries: 5}, NewRetryConditionMatch()),
+	}
+	policy := NewRunnerWithOptions(t.Context(), policyDef, RunnerOpts[int32]{
+		Disposer: func(i int32) {
+			disposerCalled <- i
+		},
+	})
+	res, err := policy(fn)
+
+	require.NoError(t, err)
+	// res should contain only the last result, i.e. 4
+	assert.Equal(t, int32(4), res)
+
+	// The disposer should be 3 times called with values 1, 2, 3
+	disposed := make([]int32, 0, 3)
+	for range 3 {
+		disposed = append(disposed, <-disposerCalled)
+	}
+	// Shouldn't have more messages coming in
+	select {
+	case <-time.After(100 * time.Millisecond):
+		// all good
+	case <-disposerCalled:
+		t.Error("received an extra message we were not expecting")
+	}
+	slices.Sort(disposed)
+	assert.Equal(t, []int32{1, 2, 3}, disposed)
+}
+
+func TestHasBoundedRetries(t *testing.T) {
+	t.Run("no retry configured", func(t *testing.T) {
+		assert.False(t, PolicyDefinition{}.HasBoundedRetries())
+	})
+
+	t.Run("bounded by attempt count", func(t *testing.T) {
+		p := PolicyDefinition{r: NewRetry(retry.Config{Policy: retry.PolicyConstant, MaxRetries: 3}, RetryConditionMatch{})}
+		assert.True(t, p.HasBoundedRetries())
+	})
+
+	t.Run("try once then give up", func(t *testing.T) {
+		p := PolicyDefinition{r: NewRetry(retry.Config{Policy: retry.PolicyConstant, MaxRetries: 0}, RetryConditionMatch{})}
+		assert.True(t, p.HasBoundedRetries(), "maxRetries 0 is an explicit give-up after one attempt")
+	})
+
+	t.Run("constant with unlimited retries", func(t *testing.T) {
+		p := PolicyDefinition{r: NewRetry(retry.Config{Policy: retry.PolicyConstant, MaxRetries: -1}, RetryConditionMatch{})}
+		assert.False(t, p.HasBoundedRetries(), "a constant policy with no attempt cap never runs out")
+	})
+
+	t.Run("exponential bounded by elapsed time", func(t *testing.T) {
+		// backoff enforces MaxElapsedTime independently of the attempt count,
+		// so this policy runs out even though MaxRetries is negative.
+		p := PolicyDefinition{r: NewRetry(retry.Config{
+			Policy:         retry.PolicyExponential,
+			MaxRetries:     -1,
+			MaxElapsedTime: time.Minute,
+		}, RetryConditionMatch{})}
+		assert.True(t, p.HasBoundedRetries())
+	})
+
+	t.Run("exponential with no elapsed time limit", func(t *testing.T) {
+		p := PolicyDefinition{r: NewRetry(retry.Config{
+			Policy:     retry.PolicyExponential,
+			MaxRetries: -1,
+		}, RetryConditionMatch{})}
+		assert.False(t, p.HasBoundedRetries())
+	})
+}
+
+func TestRetryExcluded(t *testing.T) {
+	match, err := ParseRetryConditionMatch(&resiliencyV1alpha.RetryMatching{HTTPStatusCodes: "500"})
+	require.NoError(t, err)
+	p := PolicyDefinition{r: NewRetry(retry.Config{Policy: retry.PolicyConstant, MaxRetries: 3}, match)}
+
+	t.Run("status the policy retries", func(t *testing.T) {
+		assert.False(t, p.RetryExcluded(NewCodeError(500, errors.New("server error"))))
+	})
+
+	t.Run("status the policy leaves out", func(t *testing.T) {
+		assert.True(t, p.RetryExcluded(NewCodeError(404, errors.New("not found"))))
+	})
+
+	t.Run("an error carrying no status code", func(t *testing.T) {
+		assert.False(t, p.RetryExcluded(errors.New("plain failure")))
+	})
+
+	t.Run("no retry configured", func(t *testing.T) {
+		assert.False(t, PolicyDefinition{}.RetryExcluded(NewCodeError(404, errors.New("not found"))))
+	})
+}

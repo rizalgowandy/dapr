@@ -1,0 +1,120 @@
+/*
+Copyright 2025 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package stream
+
+import (
+	"errors"
+	"fmt"
+	"io"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/diagridio/go-etcd-cron/api"
+
+	schedulerv1pb "github.com/dapr/dapr/pkg/proto/scheduler/v1"
+	"github.com/dapr/dapr/pkg/scheduler/monitoring"
+	"github.com/dapr/dapr/pkg/scheduler/server/internal/pool/loops"
+)
+
+// recvLoop is the main loop for receiving messages from the stream. It
+// handles errors and calls the recv function to receive messages.
+func (s *stream) recvLoop() {
+	for {
+		err := s.recv()
+		if err == nil {
+			continue
+		}
+
+		isEOF := errors.Is(err, io.EOF)
+		status, ok := status.FromError(err)
+		if s.channel.Context().Err() != nil || isEOF || (ok && status.Code() != codes.Canceled) {
+			return
+		}
+
+		log.Warnf("Error receiving from stream %s/%s: %s", s.ns, s.appID, err)
+		monitoring.RecordSidecarRecvError()
+		return
+	}
+}
+
+// recv receives a message from the stream. It checks the result and calls
+// the inflight result function with the appropriate result.
+func (s *stream) recv() error {
+	resp, err := s.channel.Recv()
+	if err != nil {
+		return err
+	}
+
+	if ps := resp.GetPullSlots(); ps != nil {
+		s.nsLoop.Enqueue(&loops.PullSlotsUpdate{
+			Namespace:    s.ns,
+			StreamIDx:    s.idx,
+			AppID:        s.appID,
+			ActorAddress: s.address,
+			ActorType:    ps.GetActorType(),
+			Free:         ps.GetFree(),
+		})
+		return nil
+	}
+
+	result := resp.GetResult()
+	if result == nil {
+		return errors.New("received nil result from stream")
+	}
+
+	if ref := result.GetReminder(); ref != nil {
+		s.nsLoop.Enqueue(&loops.PullResult{
+			Namespace:    s.ns,
+			StreamIDx:    s.idx,
+			AppID:        s.appID,
+			ActorAddress: s.address,
+			Reminder:     ref,
+			Status:       result.GetStatus(),
+		})
+		return nil
+	}
+
+	inf, ok := s.inflight.LoadAndDelete(result.GetId())
+	if !ok {
+		// A result whose id matches no inflight entry is a duplicate or
+		// stale ack, for example a client retry, or an ack racing the
+		// failed-Send resolution which already resolved the trigger. Drop
+		// it rather than treating it as a protocol error: closing the
+		// stream would abort every other inflight trigger on it.
+		log.Warnf("Dropping unknown trigger response %d from %s/%s", result.GetId(), s.ns, s.appID)
+		return nil
+	}
+
+	req := inf.(*loops.TriggerRequest)
+	switch result.GetStatus() {
+	case schedulerv1pb.WatchJobsRequestResultStatus_SUCCESS:
+		req.ResultFn(api.TriggerResponseResult_SUCCESS)
+	case schedulerv1pb.WatchJobsRequestResultStatus_FAILED:
+		req.ResultFn(api.TriggerResponseResult_FAILED)
+	case schedulerv1pb.WatchJobsRequestResultStatus_NO_CAPACITY:
+		if req.Repark != nil {
+			req.Repark()
+		} else {
+			req.ResultFn(api.TriggerResponseResult_FAILED)
+		}
+	default:
+		// Already removed from inflight: resolve it, or the trigger and the
+		// gates it holds leak.
+		req.ResultFn(api.TriggerResponseResult_FAILED)
+		return fmt.Errorf("unknown trigger response status: %s", result.GetStatus())
+	}
+
+	return nil
+}

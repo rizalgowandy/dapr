@@ -1,155 +1,197 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package api
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"strconv"
+	"sync/atomic"
+	"time"
 
-	"github.com/pkg/errors"
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/types/known/emptypb"
-	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	componentsapi "github.com/dapr/dapr/pkg/apis/components/v1alpha1"
 	configurationapi "github.com/dapr/dapr/pkg/apis/configuration/v1alpha1"
-	subscriptionsapi "github.com/dapr/dapr/pkg/apis/subscriptions/v1alpha1"
-	dapr_credentials "github.com/dapr/dapr/pkg/credentials"
+	httpendpointsapi "github.com/dapr/dapr/pkg/apis/httpEndpoint/v1alpha1"
+	mcpserverapi "github.com/dapr/dapr/pkg/apis/mcpserver/v1alpha1"
+	resiliencyapi "github.com/dapr/dapr/pkg/apis/resiliency/v1alpha1"
+	subapi "github.com/dapr/dapr/pkg/apis/subscriptions/v2alpha1"
+	wfaclapi "github.com/dapr/dapr/pkg/apis/workflowaccesspolicy/v1alpha1"
+	"github.com/dapr/dapr/pkg/operator/api/informer"
 	operatorv1pb "github.com/dapr/dapr/pkg/proto/operator/v1"
+	"github.com/dapr/dapr/pkg/security"
+	"github.com/dapr/kit/concurrency"
 	"github.com/dapr/kit/logger"
 )
 
-const serverPort = 6500
+const (
+	APIVersionV1alpha1    = "dapr.io/v1alpha1"
+	APIVersionV2alpha1    = "dapr.io/v2alpha1"
+	kubernetesSecretStore = "kubernetes"
+)
 
 var log = logger.NewLogger("dapr.operator.api")
 
-// Server runs the Dapr API server for components and configurations
+type Options struct {
+	Client    client.Client
+	Cache     cache.Cache
+	PodReader client.Reader
+	// PodAPIReader reads pods directly from the API server, bypassing the
+	// cache. Used when a connecting app's pod is not yet in PodReader.
+	PodAPIReader  client.Reader
+	Security      security.Provider
+	Port          int
+	ListenAddress string
+}
+
+// Server runs the Dapr API server for components and configurations.
 type Server interface {
-	Run(certChain *dapr_credentials.CertChain)
-	OnComponentUpdated(component *componentsapi.Component)
+	Run(context.Context) error
+	Ready(context.Context) error
 }
 
 type apiServer struct {
-	Client     client.Client
-	updateChan chan (*componentsapi.Component)
+	operatorv1pb.UnimplementedOperatorServer
+	Client        client.Client
+	podReader     client.Reader
+	podAPIReader  client.Reader
+	sec           security.Provider
+	port          string
+	listenAddress string
+
+	compInformer       informer.Interface[componentsapi.Component]
+	subInformer        informer.Interface[subapi.Subscription]
+	endpointInformer   informer.Interface[httpendpointsapi.HTTPEndpoint]
+	configInformer     informer.Interface[configurationapi.Configuration]
+	resiliencyInformer informer.Interface[resiliencyapi.Resiliency]
+	mcpServerInformer  informer.Interface[mcpserverapi.MCPServer]
+	policyInformer     informer.Interface[wfaclapi.WorkflowAccessPolicy]
+
+	readyCh chan struct{}
+	running atomic.Bool
+	closed  atomic.Bool
 }
 
-// NewAPIServer returns a new API server
-func NewAPIServer(client client.Client) Server {
+// NewAPIServer returns a new API server.
+func NewAPIServer(opts Options) Server {
+	// Fall back to the (cached) client when no dedicated pod reader is provided,
+	// so the server is safe to construct without the metadata-only optimization.
+	podReader := opts.PodReader
+	if podReader == nil {
+		podReader = opts.Client
+	}
+
 	return &apiServer{
-		Client:     client,
-		updateChan: make(chan *componentsapi.Component, 1),
+		Client:       opts.Client,
+		podReader:    podReader,
+		podAPIReader: opts.PodAPIReader,
+		compInformer: informer.New[componentsapi.Component](informer.Options{
+			Cache: opts.Cache,
+		}),
+		subInformer: informer.New[subapi.Subscription](informer.Options{
+			Cache: opts.Cache,
+		}),
+		endpointInformer: informer.New[httpendpointsapi.HTTPEndpoint](informer.Options{
+			Cache: opts.Cache,
+		}),
+		mcpServerInformer: informer.New[mcpserverapi.MCPServer](informer.Options{
+			Cache: opts.Cache,
+		}),
+		configInformer: informer.New[configurationapi.Configuration](informer.Options{
+			Cache: opts.Cache,
+		}),
+		resiliencyInformer: informer.New[resiliencyapi.Resiliency](informer.Options{
+			Cache: opts.Cache,
+		}),
+		policyInformer: informer.New[wfaclapi.WorkflowAccessPolicy](informer.Options{
+			Cache: opts.Cache,
+		}),
+		sec:           opts.Security,
+		port:          strconv.Itoa(opts.Port),
+		listenAddress: opts.ListenAddress,
+		readyCh:       make(chan struct{}),
 	}
 }
 
-// Run starts a new gRPC server
-func (a *apiServer) Run(certChain *dapr_credentials.CertChain) {
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%v", serverPort))
-	if err != nil {
-		log.Fatal("error starting tcp listener: %s", err)
+// Run starts a new gRPC server.
+func (a *apiServer) Run(ctx context.Context) error {
+	if !a.running.CompareAndSwap(false, true) {
+		return errors.New("api server already running")
 	}
 
-	opts, err := dapr_credentials.GetServerOptions(certChain)
+	log.Infof("Starting gRPC server on %s:%s", a.listenAddress, a.port)
+
+	sec, err := a.sec.Handler(ctx)
 	if err != nil {
-		log.Fatal("error creating gRPC options: %s", err)
+		return err
 	}
-	s := grpc.NewServer(opts...)
+
+	s := grpc.NewServer(sec.GRPCServerOptionMTLS())
 	operatorv1pb.RegisterOperatorServer(s, a)
 
-	log.Info("starting gRPC server")
-	if err := s.Serve(lis); err != nil {
-		log.Fatalf("gRPC server error: %v", err)
-	}
-}
-
-func (a *apiServer) OnComponentUpdated(component *componentsapi.Component) {
-	a.updateChan <- component
-}
-
-// GetConfiguration returns a Dapr configuration
-func (a *apiServer) GetConfiguration(ctx context.Context, in *operatorv1pb.GetConfigurationRequest) (*operatorv1pb.GetConfigurationResponse, error) {
-	key := types.NamespacedName{Namespace: in.Namespace, Name: in.Name}
-	var config configurationapi.Configuration
-	if err := a.Client.Get(ctx, key, &config); err != nil {
-		return nil, errors.Wrap(err, "error getting configuration")
-	}
-	b, err := json.Marshal(&config)
+	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%s", a.listenAddress, a.port))
 	if err != nil {
-		return nil, errors.Wrap(err, "error marshalling configuration")
+		return fmt.Errorf("error starting tcp listener: %w", err)
 	}
-	return &operatorv1pb.GetConfigurationResponse{
-		Configuration: b,
-	}, nil
-}
+	close(a.readyCh)
 
-// GetComponents returns a list of Dapr components
-func (a *apiServer) ListComponents(ctx context.Context, in *emptypb.Empty) (*operatorv1pb.ListComponentResponse, error) {
-	var components componentsapi.ComponentList
-	if err := a.Client.List(ctx, &components); err != nil {
-		return nil, errors.Wrap(err, "error getting components")
-	}
-	resp := &operatorv1pb.ListComponentResponse{
-		Components: [][]byte{},
-	}
-	for i := range components.Items {
-		c := components.Items[i] // Make a copy since we will refer to this as a reference in this loop.
-		b, err := json.Marshal(&c)
-		if err != nil {
-			log.Warnf("error marshalling component: %s", err)
-			continue
-		}
-		resp.Components = append(resp.Components, b)
-	}
-	return resp, nil
-}
-
-// ListSubscriptions returns a list of Dapr pub/sub subscriptions
-func (a *apiServer) ListSubscriptions(ctx context.Context, in *emptypb.Empty) (*operatorv1pb.ListSubscriptionsResponse, error) {
-	var subs subscriptionsapi.SubscriptionList
-	if err := a.Client.List(ctx, &subs); err != nil {
-		return nil, errors.Wrap(err, "error getting subscriptions")
-	}
-	resp := &operatorv1pb.ListSubscriptionsResponse{
-		Subscriptions: [][]byte{},
-	}
-	for i := range subs.Items {
-		s := subs.Items[i] // Make a copy since we will refer to this as a reference in this loop.
-		b, err := json.Marshal(&s)
-		if err != nil {
-			log.Warnf("error marshalling subscription: %s", err)
-			continue
-		}
-		resp.Subscriptions = append(resp.Subscriptions, b)
-	}
-	return resp, nil
-}
-
-// ComponentUpdate updates Dapr sidecars whenever a component in the cluster is modified
-func (a *apiServer) ComponentUpdate(in *emptypb.Empty, srv operatorv1pb.Operator_ComponentUpdateServer) error {
-	log.Info("sidecar connected for component updates")
-
-	for c := range a.updateChan {
-		go func(c *componentsapi.Component) {
-			b, err := json.Marshal(&c)
-			if err != nil {
-				log.Warnf("error serializing component %s (%s): %s", c.GetName(), c.Spec.Type, err)
-				return
+	return concurrency.NewRunnerManager(
+		a.compInformer.Run,
+		a.subInformer.Run,
+		a.endpointInformer.Run,
+		a.mcpServerInformer.Run,
+		a.configInformer.Run,
+		a.resiliencyInformer.Run,
+		a.policyInformer.Run,
+		func(ctx context.Context) error {
+			if err := s.Serve(lis); err != nil {
+				return fmt.Errorf("gRPC server error: %w", err)
 			}
-			err = srv.Send(&operatorv1pb.ComponentUpdateEvent{
-				Component: b,
-			})
-			if err != nil {
-				log.Warnf("error updating sidecar with component %s (%s): %s", c.GetName(), c.Spec.Type, err)
-				return
+			return nil
+		},
+		func(ctx context.Context) error {
+			// Block until context is done
+			<-ctx.Done()
+			a.closed.Store(true)
+			// Stop gracefully, but fall back to a forceful stop if a streaming
+			// handler does not return promptly, so shutdown cannot hang.
+			done := make(chan struct{})
+			go func() {
+				s.GracefulStop()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				s.Stop()
+				<-done
 			}
-			log.Infof("updated sidecar with component %s (%s)", c.GetName(), c.Spec.Type)
-		}(c)
+			return nil
+		},
+	).Run(ctx)
+}
+
+func (a *apiServer) Ready(ctx context.Context) error {
+	select {
+	case <-a.readyCh:
+		return nil
+	case <-ctx.Done():
+		return errors.New("timeout waiting for api server to be ready")
 	}
-	return nil
 }

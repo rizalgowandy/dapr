@@ -1,0 +1,757 @@
+/*
+Copyright 2024 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package http
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	workflowacl "github.com/dapr/dapr/pkg/acl/workflow"
+	actorapi "github.com/dapr/dapr/pkg/actors/api"
+	actorerrors "github.com/dapr/dapr/pkg/actors/errors"
+	"github.com/dapr/dapr/pkg/actors/reminders"
+	actortimers "github.com/dapr/dapr/pkg/actors/timers"
+	"github.com/dapr/dapr/pkg/api/http/endpoints"
+	diagConsts "github.com/dapr/dapr/pkg/diagnostics/consts"
+	"github.com/dapr/dapr/pkg/messages"
+	methodutil "github.com/dapr/dapr/pkg/messaging/method"
+	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
+	internalsv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
+	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
+	"github.com/dapr/dapr/pkg/resiliency"
+)
+
+var endpointGroupActorV1State = &endpoints.EndpointGroup{
+	Name:                 endpoints.EndpointGroupActors,
+	Version:              endpoints.EndpointGroupVersion1,
+	AppendSpanAttributes: appendActorStateSpanAttributesFn,
+}
+
+// For timers and reminders
+var endpointGroupActorV1Misc = &endpoints.EndpointGroup{
+	Name:                 endpoints.EndpointGroupActors,
+	Version:              endpoints.EndpointGroupVersion1,
+	AppendSpanAttributes: appendActorReminderTimerSpanAttributesFn,
+}
+
+func appendActorStateSpanAttributesFn(r *http.Request, m map[string]string) {
+	m[diagConsts.DaprAPIActorTypeID] = chi.URLParam(r, actorTypeParam) + "." + chi.URLParam(r, actorIDParam)
+	m[diagConsts.DBSystemSpanAttributeKey] = diagConsts.StateBuildingBlockType
+	m[diagConsts.DBConnectionStringSpanAttributeKey] = diagConsts.StateBuildingBlockType
+	m[diagConsts.DBStatementSpanAttributeKey] = r.Method + " " + r.URL.Path
+	m[diagConsts.DBNameSpanAttributeKey] = "actor"
+}
+
+func appendActorInvocationSpanAttributesFn(r *http.Request, m map[string]string) {
+	actorType := chi.URLParam(r, actorTypeParam)
+	actorTypeID := actorType + "." + chi.URLParam(r, actorIDParam)
+	m[diagConsts.DaprAPIActorTypeID] = actorTypeID
+	m[diagConsts.GrpcServiceSpanAttributeKey] = "ServiceInvocation"
+	m[diagConsts.NetPeerNameSpanAttributeKey] = actorTypeID
+	m[diagConsts.DaprAPISpanNameInternal] = "CallActor/" + actorType + "/" + chi.URLParam(r, "method")
+}
+
+// appendActorReminderTimerSpanAttributesFn sets a bounded span name for the
+// reminder and timer endpoints. The raw request path embeds the unbounded
+// actorId and reminder/timer name, so it must not be used as the span name
+// (it causes a tracing cardinality explosion, see issue #4703). The bounded
+// endpoint name and actorType are used instead, dropping actorId and name.
+func appendActorReminderTimerSpanAttributesFn(r *http.Request, m map[string]string) {
+	actorType := chi.URLParam(r, actorTypeParam)
+	m[diagConsts.DaprAPIActorTypeID] = actorType + "." + chi.URLParam(r, actorIDParam)
+
+	endpointData, _ := r.Context().Value(endpoints.EndpointCtxKey{}).(*endpoints.EndpointCtxData)
+	m[diagConsts.DaprAPISpanNameInternal] = endpointData.GetEndpointName() + "/" + actorType
+}
+
+func actorInvocationMethodNameWithIDFn(r *http.Request) string {
+	return "InvokeActor/" + chi.URLParam(r, actorTypeParam) + "." + chi.URLParam(r, actorIDParam)
+}
+
+func actorInvocationMethodNameFn(r *http.Request) string {
+	return "InvokeActor/" + chi.URLParam(r, actorTypeParam)
+}
+
+func (a *api) constructActorEndpoints() []endpoints.Endpoint {
+	methodNameFn := actorInvocationMethodNameWithIDFn
+	if a.metricSpec != nil && !a.metricSpec.GetHTTPIncreasedCardinality(log) {
+		methodNameFn = actorInvocationMethodNameFn
+	}
+	return []endpoints.Endpoint{
+		{
+			Methods: []string{http.MethodPost, http.MethodPut},
+			Route:   "actors/{actorType}/{actorId}/state",
+			Version: apiVersionV1,
+			Group:   endpointGroupActorV1State,
+			Handler: a.onActorStateTransaction,
+			Settings: endpoints.EndpointSettings{
+				Name: "ExecuteActorStateTransaction",
+			},
+		},
+		{
+			Methods: []string{http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodPut},
+			Route:   "actors/{actorType}/{actorId}/method/{method}",
+			Version: apiVersionV1,
+			Group: &endpoints.EndpointGroup{
+				Name:                 endpoints.EndpointGroupActors,
+				Version:              endpoints.EndpointGroupVersion1,
+				AppendSpanAttributes: appendActorInvocationSpanAttributesFn,
+				MethodName:           methodNameFn,
+			},
+			Handler: a.onDirectActorMessage,
+			Settings: endpoints.EndpointSettings{
+				Name: "InvokeActor",
+			},
+		},
+		{
+			Methods: []string{http.MethodGet},
+			Route:   "actors/{actorType}/{actorId}/state/{key}",
+			Version: apiVersionV1,
+			Group:   endpointGroupActorV1State,
+			Handler: a.onGetActorState,
+			Settings: endpoints.EndpointSettings{
+				Name: "GetActorState",
+			},
+		},
+		{
+			Methods: []string{http.MethodPost, http.MethodPut},
+			Route:   "actors/{actorType}/{actorId}/reminders/{name}",
+			Version: apiVersionV1,
+			Group:   endpointGroupActorV1Misc,
+			Handler: a.onCreateActorReminder,
+			Settings: endpoints.EndpointSettings{
+				Name: "RegisterActorReminder",
+			},
+		},
+		{
+			Methods: []string{http.MethodPost, http.MethodPut},
+			Route:   "actors/{actorType}/{actorId}/timers/{name}",
+			Version: apiVersionV1,
+			Group:   endpointGroupActorV1Misc,
+			Handler: a.onCreateActorTimer,
+			Settings: endpoints.EndpointSettings{
+				Name: "RegisterActorTimer",
+			},
+		},
+		{
+			Methods: []string{http.MethodDelete},
+			Route:   "actors/{actorType}/{actorId}/reminders/{name}",
+			Version: apiVersionV1,
+			Group:   endpointGroupActorV1Misc,
+			Handler: a.onDeleteActorReminder(),
+			Settings: endpoints.EndpointSettings{
+				Name: "UnregisterActorReminder",
+			},
+		},
+		{
+			Methods: []string{http.MethodDelete},
+			Route:   "actors/{actorType}/{actorId}/timers/{name}",
+			Version: apiVersionV1,
+			Group:   endpointGroupActorV1Misc,
+			Handler: a.onDeleteActorTimer(),
+			Settings: endpoints.EndpointSettings{
+				Name: "UnregisterActorTimer",
+			},
+		},
+		{
+			Methods: []string{http.MethodGet},
+			Route:   "actors/{actorType}/{actorId}/reminders/{name}",
+			Version: apiVersionV1,
+			Group:   endpointGroupActorV1Misc,
+			Handler: a.onGetActorReminder(),
+			Settings: endpoints.EndpointSettings{
+				Name: "GetActorReminder",
+			},
+		},
+		{
+			Methods: []string{http.MethodGet},
+			Route:   "actors/{actorType}/{actorId}/timers",
+			Version: apiVersionV1,
+			Group:   endpointGroupActorV1Misc,
+			Handler: a.onListActorTimers(),
+			Settings: endpoints.EndpointSettings{
+				Name: "ListActorTimers",
+			},
+		},
+		{
+			Methods: []string{http.MethodGet},
+			Route:   "actors/{actorType}/{actorId}/timers/{name}",
+			Version: apiVersionV1,
+			Group:   endpointGroupActorV1Misc,
+			Handler: a.onGetActorTimer(),
+			Settings: endpoints.EndpointSettings{
+				Name: "GetActorTimer",
+			},
+		},
+		{
+			Methods: []string{http.MethodGet},
+			Route:   "actors/{actorType}/{actorId}/reminders",
+			Version: apiVersionV1,
+			Group:   endpointGroupActorV1Misc,
+			Handler: a.onListActorReminders(),
+			Settings: endpoints.EndpointSettings{
+				Name: "ListActorReminders",
+			},
+		},
+	}
+}
+
+func (a *api) onCreateActorReminder(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	actorType := chi.URLParamFromCtx(ctx, actorTypeParam)
+	if err := a.universal.RejectInternalActorType(actorType); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	var req actorapi.CreateReminderRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		msg := messages.ErrMalformedRequest.WithFormat(err)
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+
+	name := chi.URLParamFromCtx(ctx, nameParam)
+	if vErr := methodutil.ValidateName(name); vErr != nil {
+		msg := messages.ErrBadRequest.WithFormat(vErr)
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+	req.Name = name
+	req.ActorType = actorType
+	req.ActorID = chi.URLParamFromCtx(ctx, actorIDParam)
+
+	rem, err := a.universal.ActorReminders(ctx)
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	err = rem.Create(ctx, &req)
+	if err != nil {
+		if errors.Is(err, reminders.ErrReminderOpActorNotHosted) {
+			msg := messages.ErrActorReminderOpActorNotHosted
+			respondWithError(w, msg)
+			log.Debug(msg)
+			return
+		}
+
+		status, ok := status.FromError(err)
+		if ok && status.Code() == codes.AlreadyExists {
+			msg := messages.ErrActorReminderAlreadyExists.WithFormat(req.Name)
+			respondWithError(w, msg)
+			log.Debug(msg)
+			return
+		}
+
+		msg := messages.ErrActorReminderCreate.WithFormat(err)
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+
+	respondWithEmpty(w)
+}
+
+func (a *api) onCreateActorTimer(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	actorType := chi.URLParamFromCtx(ctx, actorTypeParam)
+	if err := a.universal.RejectInternalActorType(actorType); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	var req actorapi.CreateTimerRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		msg := messages.ErrMalformedRequest.WithFormat(err)
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+
+	name := chi.URLParamFromCtx(ctx, nameParam)
+	if vErr := methodutil.ValidateName(name); vErr != nil {
+		msg := messages.ErrBadRequest.WithFormat(vErr)
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+	req.Name = name
+	req.ActorType = actorType
+	req.ActorID = chi.URLParamFromCtx(ctx, actorIDParam)
+
+	timers, err := a.universal.ActorTimers(ctx)
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	err = timers.Create(ctx, &req)
+	if err != nil {
+		if errors.Is(err, actortimers.ErrTimerActorNotOwned) {
+			respondWithError(w, messages.ErrActorTimerOpActorNotOwned)
+			log.Debug(messages.ErrActorTimerOpActorNotOwned)
+			return
+		}
+
+		msg := messages.ErrActorTimerCreate.WithFormat(err)
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+
+	respondWithEmpty(w)
+}
+
+func (a *api) onDeleteActorReminder() http.HandlerFunc {
+	return UniversalHTTPHandler(
+		a.universal.UnregisterActorReminder,
+		UniversalHTTPHandlerOpts[*runtimev1pb.UnregisterActorReminderRequest, *emptypb.Empty]{
+			InModifier: func(r *http.Request, in *runtimev1pb.UnregisterActorReminderRequest) (*runtimev1pb.UnregisterActorReminderRequest, error) {
+				in.ActorType = chi.URLParam(r, actorTypeParam)
+				in.ActorId = chi.URLParam(r, actorIDParam)
+				in.Name = chi.URLParam(r, nameParam)
+				return in, nil
+			},
+		},
+	)
+}
+
+func (a *api) onActorStateTransaction(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	actorType := chi.URLParamFromCtx(ctx, actorTypeParam)
+	if err := a.universal.RejectInternalActorType(actorType); err != nil {
+		respondWithError(w, err)
+		return
+	}
+	actorID := chi.URLParamFromCtx(ctx, actorIDParam)
+
+	var ops []actorapi.TransactionalOperation
+	err := json.NewDecoder(r.Body).Decode(&ops)
+	if err != nil {
+		msg := messages.ErrMalformedRequest.WithFormat(err)
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+
+	req := &actorapi.TransactionalRequest{
+		ActorID:    actorID,
+		ActorType:  actorType,
+		Operations: ops,
+	}
+
+	state, err := a.universal.ActorState(ctx)
+	if err != nil {
+		respondWithError(w, err)
+		log.Debug(err)
+		return
+	}
+
+	err = state.TransactionalStateOperation(ctx, false, req, true)
+	if err != nil {
+		if errors.As(err, new(messages.APIError)) {
+			respondWithError(w, err)
+			log.Debug(err)
+			return
+		}
+
+		msg := messages.ErrActorStateTransactionSave.WithFormat(err)
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+
+	respondWithEmpty(w)
+}
+
+// actorReminderJSON is the HTTP representation of a reminder, shared by the
+// get and list endpoints. Name is only populated by the list endpoint.
+type actorReminderJSON struct {
+	Name      string          `json:"name,omitempty"`
+	ActorID   string          `json:"actorID,omitempty"`
+	ActorType string          `json:"actorType,omitempty"`
+	Data      json.RawMessage `json:"data,omitempty"`
+	DueTime   *string         `json:"dueTime,omitempty"`
+	Period    *string         `json:"period,omitempty"`
+	TTL       *string         `json:"ttl,omitempty"`
+}
+
+func newActorReminderJSON(name, actorType, actorID string, dueTime, period, ttl *string, data *anypb.Any) (actorReminderJSON, error) {
+	d, err := anyToRawJSON(data)
+	if err != nil {
+		return actorReminderJSON{}, err
+	}
+	return actorReminderJSON{
+		Name:      name,
+		ActorID:   actorID,
+		ActorType: actorType,
+		Data:      d,
+		DueTime:   dueTime,
+		Period:    period,
+		TTL:       ttl,
+	}, nil
+}
+
+func (a *api) onGetActorReminder() http.HandlerFunc {
+	return UniversalHTTPHandler(
+		a.universal.GetActorReminder,
+		UniversalHTTPHandlerOpts[*runtimev1pb.GetActorReminderRequest, *runtimev1pb.GetActorReminderResponse]{
+			SkipInputBody: true,
+			OutModifier: func(out *runtimev1pb.GetActorReminderResponse) (any, error) {
+				return newActorReminderJSON("", out.GetActorType(), out.GetActorId(), out.DueTime, out.Period, out.Ttl, out.GetData())
+			},
+			InModifier: func(r *http.Request, in *runtimev1pb.GetActorReminderRequest) (*runtimev1pb.GetActorReminderRequest, error) {
+				in.ActorType = chi.URLParam(r, actorTypeParam)
+				in.ActorId = chi.URLParam(r, actorIDParam)
+				in.Name = chi.URLParam(r, nameParam)
+				return in, nil
+			},
+		},
+	)
+}
+
+// onListActorReminders lists the reminders of a single actor. The gRPC
+// ListActorReminders also supports listing a whole actor type; that has no
+// natural route in the actors HTTP API, so it is not exposed here.
+func (a *api) onListActorReminders() http.HandlerFunc {
+	return UniversalHTTPHandler(
+		a.universal.ListActorReminders,
+		UniversalHTTPHandlerOpts[*runtimev1pb.ListActorRemindersRequest, *runtimev1pb.ListActorRemindersResponse]{
+			SkipInputBody: true,
+			InModifier: func(r *http.Request, in *runtimev1pb.ListActorRemindersRequest) (*runtimev1pb.ListActorRemindersRequest, error) {
+				in.ActorType = chi.URLParam(r, actorTypeParam)
+				in.ActorId = new(chi.URLParam(r, actorIDParam))
+				return in, nil
+			},
+			OutModifier: func(out *runtimev1pb.ListActorRemindersResponse) (any, error) {
+				// Always a non-nil slice so an empty list serializes as [].
+				reminders := make([]actorReminderJSON, 0, len(out.GetReminders()))
+				for _, nr := range out.GetReminders() {
+					r := nr.GetReminder()
+					m, err := newActorReminderJSON(nr.GetName(), r.GetActorType(), r.GetActorId(), r.DueTime, r.Period, r.Ttl, r.GetData())
+					if err != nil {
+						return nil, err
+					}
+					reminders = append(reminders, m)
+				}
+
+				return struct {
+					Reminders []actorReminderJSON `json:"reminders"`
+				}{Reminders: reminders}, nil
+			},
+		},
+	)
+}
+
+// anyToRawJSON unwraps the data payload of a reminder or timer for HTTP
+// responses: a BytesValue carries the raw JSON the user registered, any other
+// message is rendered with protojson.
+func anyToRawJSON(data *anypb.Any) (json.RawMessage, error) {
+	if data == nil {
+		return nil, nil
+	}
+	msg, err := data.UnmarshalNew()
+	if err != nil {
+		return nil, err
+	}
+	switch mm := msg.(type) {
+	case *wrapperspb.BytesValue:
+		return mm.GetValue(), nil
+	default:
+		d, err := protojson.Marshal(mm)
+		if err != nil {
+			return nil, err
+		}
+		return json.RawMessage(d), nil
+	}
+}
+
+// actorTimerJSON is the HTTP representation of a timer, shared by the get and
+// list endpoints. Name is only populated by the list endpoint.
+type actorTimerJSON struct {
+	Name      string          `json:"name,omitempty"`
+	ActorType string          `json:"actorType,omitempty"`
+	ActorID   string          `json:"actorID,omitempty"`
+	DueTime   *string         `json:"dueTime,omitempty"`
+	Period    *string         `json:"period,omitempty"`
+	TTL       *string         `json:"ttl,omitempty"`
+	Callback  *string         `json:"callback,omitempty"`
+	Data      json.RawMessage `json:"data,omitempty"`
+}
+
+func newActorTimerJSON(name string, t *runtimev1pb.ActorTimer) (actorTimerJSON, error) {
+	data, err := anyToRawJSON(t.GetData())
+	if err != nil {
+		return actorTimerJSON{}, err
+	}
+	return actorTimerJSON{
+		Name:      name,
+		ActorType: t.GetActorType(),
+		ActorID:   t.GetActorId(),
+		DueTime:   t.DueTime,
+		Period:    t.Period,
+		TTL:       t.Ttl,
+		Callback:  t.Callback,
+		Data:      data,
+	}, nil
+}
+
+func (a *api) onGetActorTimer() http.HandlerFunc {
+	return UniversalHTTPHandler(
+		a.universal.GetActorTimer,
+		UniversalHTTPHandlerOpts[*runtimev1pb.GetActorTimerRequest, *runtimev1pb.GetActorTimerResponse]{
+			SkipInputBody: true,
+			InModifier: func(r *http.Request, in *runtimev1pb.GetActorTimerRequest) (*runtimev1pb.GetActorTimerRequest, error) {
+				in.ActorType = chi.URLParam(r, actorTypeParam)
+				in.ActorId = chi.URLParam(r, actorIDParam)
+				in.Name = chi.URLParam(r, nameParam)
+				return in, nil
+			},
+			OutModifier: func(out *runtimev1pb.GetActorTimerResponse) (any, error) {
+				return newActorTimerJSON("", &runtimev1pb.ActorTimer{
+					ActorType: out.GetActorType(),
+					ActorId:   out.GetActorId(),
+					DueTime:   out.DueTime,
+					Period:    out.Period,
+					Ttl:       out.Ttl,
+					Callback:  out.Callback,
+					Data:      out.GetData(),
+				})
+			},
+		},
+	)
+}
+
+func (a *api) onListActorTimers() http.HandlerFunc {
+	return UniversalHTTPHandler(
+		a.universal.ListActorTimers,
+		UniversalHTTPHandlerOpts[*runtimev1pb.ListActorTimersRequest, *runtimev1pb.ListActorTimersResponse]{
+			SkipInputBody: true,
+			InModifier: func(r *http.Request, in *runtimev1pb.ListActorTimersRequest) (*runtimev1pb.ListActorTimersRequest, error) {
+				in.ActorType = chi.URLParam(r, actorTypeParam)
+				in.ActorId = chi.URLParam(r, actorIDParam)
+				return in, nil
+			},
+			OutModifier: func(out *runtimev1pb.ListActorTimersResponse) (any, error) {
+				// Always a non-nil slice so an empty list serializes as [].
+				timers := make([]actorTimerJSON, 0, len(out.GetTimers()))
+				for _, nt := range out.GetTimers() {
+					t, err := newActorTimerJSON(nt.GetName(), nt.GetTimer())
+					if err != nil {
+						return nil, err
+					}
+					timers = append(timers, t)
+				}
+
+				return struct {
+					Timers []actorTimerJSON `json:"timers"`
+				}{Timers: timers}, nil
+			},
+		},
+	)
+}
+
+func (a *api) onDeleteActorTimer() http.HandlerFunc {
+	return UniversalHTTPHandler(
+		a.universal.UnregisterActorTimer,
+		UniversalHTTPHandlerOpts[*runtimev1pb.UnregisterActorTimerRequest, *emptypb.Empty]{
+			InModifier: func(r *http.Request, in *runtimev1pb.UnregisterActorTimerRequest) (*runtimev1pb.UnregisterActorTimerRequest, error) {
+				in.ActorType = chi.URLParam(r, actorTypeParam)
+				in.ActorId = chi.URLParam(r, actorIDParam)
+				in.Name = chi.URLParam(r, nameParam)
+				return in, nil
+			},
+		},
+	)
+}
+
+func (a *api) onDirectActorMessage(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	actorType := chi.URLParamFromCtx(ctx, actorTypeParam)
+	if err := a.universal.RejectInternalActorType(actorType); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	router, err := a.universal.ActorRouter(ctx)
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	actorID := chi.URLParamFromCtx(ctx, actorIDParam)
+	for _, param := range []struct{ name, val string }{
+		{"actorType", actorType}, {"actorId", actorID},
+	} {
+		if vErr := methodutil.ValidateName(param.val); vErr != nil {
+			msg := messages.ErrBadRequest.WithFormat(fmt.Sprintf("invalid %s: %v", param.name, vErr))
+			respondWithError(w, msg)
+			log.Debug(msg)
+			return
+		}
+	}
+	verb := strings.ToUpper(r.Method)
+	method, err := methodutil.NormalizeMethod(chi.URLParamFromCtx(ctx, methodParam))
+	if err != nil {
+		msg := messages.ErrBadRequest.WithFormat(err)
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+
+	// Actor invocation doesn't support streaming, so we need to read the entire reqBody
+	reqBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		msg := messages.ErrBadRequest.WithFormat("failed to read body: " + err.Error())
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+
+	r.Header.Add("Dapr-API-Call", "true")
+	req := internalsv1pb.NewInternalInvokeRequest(method).
+		WithActor(actorType, actorID).
+		WithHTTPExtension(verb, r.URL.RawQuery).
+		WithData(reqBody).
+		WithContentType(r.Header.Get("content-type")).
+		// Save headers to internal metadata
+		WithHTTPHeaders(r.Header)
+
+	// Drop caller-identity headers that the client may have sent; the
+	// router stamps the trusted local sidecar identity itself.
+	workflowacl.StripUntrustedCallerIdentity(req.GetMetadata())
+
+	// Unlike other actor calls, resiliency is handled here for invocation.
+	// This is due to actor invocation involving a lookup for the host.
+	policyDef := a.universal.Resiliency().ActorPreLockPolicy(actorType, actorID)
+	policyRunner := resiliency.NewRunner[*internalsv1pb.InternalInvokeResponse](ctx, policyDef)
+	res, err := policyRunner(func(ctx context.Context) (*internalsv1pb.InternalInvokeResponse, error) {
+		return router.Call(ctx, req)
+	})
+	if err != nil {
+		if merr, ok := err.(messages.APIError); ok {
+			respondWithError(w, merr)
+			log.Debug(merr)
+			return
+		}
+
+		actorErr, isActorError := actorerrors.As(err)
+		if !isActorError {
+			msg := messages.ErrActorInvoke.WithFormat(err)
+			respondWithError(w, msg)
+			log.Debug(msg)
+			return
+		}
+		// Use Add to ensure headers are appended and not replaced
+		h := w.Header()
+		invokev1.InternalMetadataToHTTPHeader(ctx, actorErr.Headers(), h.Add)
+		h.Set(headerContentType, actorErr.ContentType())
+
+		// Construct response
+		respondWithData(w, actorErr.StatusCode(), actorErr.Body())
+		return
+	}
+
+	if res == nil {
+		msg := messages.ErrActorInvoke.WithFormat("failed to cast response")
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+
+	// Use Add to ensure headers are appended and not replaced
+	h := w.Header()
+	invokev1.InternalMetadataToHTTPHeader(ctx, res.GetHeaders(), h.Add)
+	h.Set(headerContentType, res.GetMessage().GetContentType())
+
+	// Construct response.
+	statusCode := int(res.GetStatus().GetCode())
+	if !res.IsHTTPResponse() {
+		// TODO: fix types
+		//nolint:gosec
+		statusCode = invokev1.HTTPStatusFromCode(codes.Code(statusCode))
+	}
+	respondWithData(w, statusCode, res.GetMessage().GetData().GetValue())
+}
+
+func (a *api) onGetActorState(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	actorType := chi.URLParamFromCtx(ctx, actorTypeParam)
+	if err := a.universal.RejectInternalActorType(actorType); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	astate, err := a.universal.ActorState(ctx)
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	actorID := chi.URLParamFromCtx(ctx, actorIDParam)
+	key := chi.URLParamFromCtx(ctx, stateKeyParam)
+
+	resp, err := astate.Get(ctx, &actorapi.GetStateRequest{
+		ActorType: actorType,
+		ActorID:   actorID,
+		Key:       key,
+	}, true)
+	if err != nil {
+		if errors.As(err, new(messages.APIError)) {
+			respondWithError(w, err)
+			log.Debug(err)
+			return
+		}
+
+		msg := messages.ErrActorStateGet.WithFormat(err)
+		respondWithError(w, msg)
+		log.Debug(msg)
+		return
+	}
+
+	if resp == nil || len(resp.Data) == 0 {
+		respondWithEmpty(w)
+		return
+	}
+
+	// Set headers
+	h := w.Header()
+	h.Set(headerContentType, jsonContentTypeHeader)
+	setResponseMetadataHeaders(w, resp.Metadata)
+
+	respondWithData(w, http.StatusOK, resp.Data)
+}

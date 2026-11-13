@@ -1,0 +1,470 @@
+/*
+Copyright 2025 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package http
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	nethttp "net/http"
+	"strings"
+	"time"
+
+	"go.opentelemetry.io/otel/baggage"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/dapr/components-contrib/contenttype"
+	contribpubsub "github.com/dapr/components-contrib/pubsub"
+	"github.com/dapr/dapr/pkg/config"
+	diag "github.com/dapr/dapr/pkg/diagnostics"
+	diagConsts "github.com/dapr/dapr/pkg/diagnostics/consts"
+	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
+	"github.com/dapr/dapr/pkg/resiliency"
+	"github.com/dapr/dapr/pkg/runtime/channels"
+	rterrors "github.com/dapr/dapr/pkg/runtime/errors"
+	"github.com/dapr/dapr/pkg/runtime/pubsub"
+	"github.com/dapr/dapr/pkg/runtime/subscription/postman"
+	"github.com/dapr/dapr/pkg/runtime/subscription/todo"
+	"github.com/dapr/kit/logger"
+)
+
+var log = logger.NewLogger("dapr.runtime.processor.pubsub.subscription.http")
+
+// deadLetterPublishTimeout is the deadline given to a DLQ publish issued
+// from this postman. The parent inbound context arrives here without
+// usable time budget after the resiliency policy exhausts, so the publish
+// is given a fresh deadline. Matches the value used in
+// pkg/runtime/subscription and the gRPC postman.
+const deadLetterPublishTimeout = 30 * time.Second
+
+type Options struct {
+	Tracing  *config.TracingSpec
+	Channels *channels.Channels
+	Adapter  pubsub.Adapter
+}
+
+type http struct {
+	tracingSpec *config.TracingSpec
+	channels    *channels.Channels
+	adapter     pubsub.Adapter
+}
+
+func New(opts Options) postman.Interface {
+	return &http{
+		tracingSpec: opts.Tracing,
+		channels:    opts.Channels,
+		adapter:     opts.Adapter,
+	}
+}
+
+func (h *http) Deliver(ctx context.Context, msg *pubsub.SubscribedMessage) error {
+	cloudEvent := msg.CloudEvent
+
+	var span trace.Span
+
+	req := invokev1.NewInvokeMethodRequest(msg.Path).
+		WithHTTPExtension(nethttp.MethodPost, "").
+		WithRawDataBytes(msg.Data).
+		WithContentType(contenttype.CloudEventContentType).
+		WithCustomHTTPMetadata(msg.Metadata)
+	defer req.Close()
+
+	// A zero parent starts a new root span, so a message delivered without
+	// inbound trace context is still traced. No ops if tracing is off.
+	sc := pubsub.ParentSpanContextFromCloudEvent(cloudEvent, log)
+	ctx, span = diag.StartInternalCallbackSpan(ctx, "pubsub/"+msg.Topic, sc, h.tracingSpec)
+
+	if span != nil {
+		// Every return path below must end the span, including the ones that
+		// bail out before the status is known. Ending a span twice is a no-op,
+		// so the success path can still set the status first.
+		defer span.End()
+	}
+
+	if baggageString, ok := cloudEvent[diagConsts.BaggageHeader].(string); ok && baggageString != "" {
+		// Forward the raw string: re-serializing parsed baggage loses member order.
+		// Drop any ctx baggage, which the HTTP channel would otherwise prefer.
+		if _, err := baggage.Parse(baggageString); err == nil {
+			ctx = baggage.ContextWithoutBaggage(ctx)
+			req.WithCustomHTTPMetadata(map[string]string{diagConsts.BaggageHeader: baggageString})
+		}
+	}
+
+	start := time.Now()
+	resp, err := h.channels.AppChannel().InvokeMethod(ctx, req, "")
+	elapsed := diag.ElapsedSince(start)
+
+	if err != nil {
+		if span != nil {
+			diag.AddAttributesToSpan(span, diag.ConstructSubscriptionSpanAttributes(msg.Topic))
+			span.SetStatus(otelcodes.Error, err.Error())
+		}
+		diag.DefaultComponentMonitoring.PubsubIngressEvent(ctx, msg.PubSub, strings.ToLower(string(contribpubsub.Retry)), "", msg.Topic, elapsed)
+		return fmt.Errorf("error returned from app channel while sending pub/sub event to app: %w", rterrors.NewRetriable(err))
+	}
+
+	defer resp.Close()
+
+	statusCode := int(resp.Status().GetCode())
+
+	if span != nil {
+		m := diag.ConstructSubscriptionSpanAttributes(msg.Topic)
+		diag.AddAttributesToSpan(span, m)
+		diag.UpdateSpanStatusFromHTTPStatus(span, statusCode)
+		span.End()
+	}
+
+	if (statusCode >= 200) && (statusCode <= 299) {
+		// Any 2xx is considered a success.
+		var appResponse contribpubsub.AppResponse
+
+		err := json.NewDecoder(resp.RawData()).Decode(&appResponse)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				log.Debugf("skipping status check due to empty response body from pub/sub event %v", cloudEvent[contribpubsub.IDField])
+			} else {
+				log.Debugf("skipping status check due to error parsing result from pub/sub event %v: %s", cloudEvent[contribpubsub.IDField], err)
+			}
+
+			diag.DefaultComponentMonitoring.PubsubIngressEvent(ctx, msg.PubSub, strings.ToLower(string(contribpubsub.Success)), "", msg.Topic, elapsed)
+
+			return nil
+		}
+
+		switch appResponse.Status {
+		case "":
+			// Consider empty status field as success
+			fallthrough
+		case contribpubsub.Success:
+			diag.DefaultComponentMonitoring.PubsubIngressEvent(ctx, msg.PubSub, strings.ToLower(string(contribpubsub.Success)), "", msg.Topic, elapsed)
+			return nil
+		case contribpubsub.Retry:
+			diag.DefaultComponentMonitoring.PubsubIngressEvent(ctx, msg.PubSub, strings.ToLower(string(contribpubsub.Retry)), "", msg.Topic, elapsed)
+			// TODO: add retry error info
+			return fmt.Errorf("RETRY status returned from app while processing pub/sub event %v: %w", cloudEvent[contribpubsub.IDField], rterrors.NewRetriable(nil))
+		case contribpubsub.Drop:
+			diag.DefaultComponentMonitoring.PubsubIngressEvent(ctx, msg.PubSub, strings.ToLower(string(contribpubsub.Drop)), strings.ToLower(string(contribpubsub.Success)), msg.Topic, elapsed)
+			log.Warnf("DROP status returned from app while processing pub/sub event %v", cloudEvent[contribpubsub.IDField])
+
+			return pubsub.ErrMessageDropped
+		}
+		// Consider unknown status field as error and retry
+		diag.DefaultComponentMonitoring.PubsubIngressEvent(ctx, msg.PubSub, strings.ToLower(string(contribpubsub.Retry)), "", msg.Topic, elapsed)
+
+		return fmt.Errorf("unknown status returned from app while processing pub/sub event %v, status: %v, err: %w", cloudEvent[contribpubsub.IDField], appResponse.Status, rterrors.NewRetriable(nil))
+	}
+
+	body, _ := resp.RawDataFull()
+	if statusCode == nethttp.StatusNotFound {
+		// These are errors that are not retriable, for now it is just 404 but more status codes can be added.
+		// When adding/removing an error here, check if that is also applicable to GRPC since there is a mapping between HTTP and GRPC errors:
+		// https://cloud.google.com/apis/design/errors#handling_errors
+		log.Errorf("non-retriable error returned from app while processing pub/sub event %v: %s. status code returned: %v", cloudEvent[contribpubsub.IDField], body, statusCode)
+		diag.DefaultComponentMonitoring.PubsubIngressEvent(ctx, msg.PubSub, strings.ToLower(string(contribpubsub.Drop)), "", msg.Topic, elapsed)
+
+		return pubsub.ErrMessageDropped
+	}
+
+	// Every error from now on is a retriable error.
+	errMsg := fmt.Sprintf("retriable error returned from app while processing pub/sub event %v, topic: %v, body: %s. status code returned: %v", cloudEvent[contribpubsub.IDField], cloudEvent[contribpubsub.TopicField], body, statusCode)
+	log.Warn(errMsg)
+	diag.DefaultComponentMonitoring.PubsubIngressEvent(ctx, msg.PubSub, strings.ToLower(string(contribpubsub.Retry)), "", msg.Topic, elapsed)
+	// return error status code for resiliency to decide on retry
+	// TODO: Update types to uint32
+	//nolint:gosec
+	return resiliency.NewCodeError(int32(statusCode), rterrors.NewRetriable(errors.New(errMsg)))
+}
+
+// DeliverBulk publishes bulk message to a subscriber using HTTP and takes care
+// of corresponding responses.
+func (h *http) DeliverBulk(ctx context.Context, req *postman.DeliverBulkRequest) error {
+	bscData := *req.BulkSubCallData
+	psm := req.BulkSubMsg
+	bsrr := req.BulkSubResiliencyRes
+	bulkSubCallData := req.BulkSubCallData
+
+	rawMsgEntries := make([]*pubsub.BulkSubscribeMessageItem, len(psm.PubSubMessages))
+
+	// This attempt may carry only some of the bulk message's entries, so look
+	// them up by ID rather than by their index in the whole message. An entry
+	// is removed once the app answers for it, leaving those it did not.
+	attemptMsgs := make(map[string]todo.Message, len(psm.PubSubMessages))
+	for i, pubSubMsg := range psm.PubSubMessages {
+		rawMsgEntries[i] = pubSubMsg.RawData
+		attemptMsgs[pubSubMsg.Entry.EntryId] = pubSubMsg
+	}
+
+	bsrr.Envelope[pubsub.Entries] = rawMsgEntries
+
+	da, marshalErr := json.Marshal(&bsrr.Envelope)
+	if marshalErr != nil {
+		log.Errorf("Error serializing bulk cloud event in pubsub %s and topic %s: %s", psm.Pubsub, psm.Topic, marshalErr)
+
+		if req.DeadLetterTopic != "" {
+			entries := make([]contribpubsub.BulkMessageEntry, len(psm.PubSubMessages))
+			for i, pubsubMsg := range psm.PubSubMessages {
+				entries[i] = *pubsubMsg.Entry
+			}
+
+			bulkMsg := contribpubsub.BulkMessage{
+				Entries:  entries,
+				Topic:    psm.Topic,
+				Metadata: psm.Metadata,
+			}
+			dlqErr := h.sendBulkToDeadLetter(ctx, bulkSubCallData, &bulkMsg, req.DeadLetterTopic)
+			if dlqErr == nil {
+				// dlq has been configured and message is successfully sent to dlq.
+				for _, item := range rawMsgEntries {
+					todo.AddBulkResponseEntry(&bsrr.Entries, item.EntryId, nil)
+				}
+
+				return nil
+			}
+		}
+
+		bscData.BulkSubDiag.AddStatusCount(contribpubsub.Retry, int64(len(rawMsgEntries)))
+
+		for _, item := range rawMsgEntries {
+			todo.AddBulkResponseEntry(&bsrr.Entries, item.EntryId, marshalErr)
+		}
+
+		return marshalErr
+	}
+
+	spans := make([]trace.Span, len(rawMsgEntries))
+
+	iReq := invokev1.NewInvokeMethodRequest(psm.Path).
+		WithHTTPExtension(nethttp.MethodPost, "").
+		WithRawDataBytes(da).
+		WithContentType(contenttype.JSONContentType).
+		WithCustomHTTPMetadata(psm.Metadata)
+	defer iReq.Close()
+
+	n := 0
+
+	for _, pubsubMsg := range psm.PubSubMessages {
+		// A zero parent starts a new root span, so an entry delivered without
+		// inbound trace context is still traced. No ops if tracing is off.
+		sc := pubsub.ParentSpanContextFromCloudEvent(pubsubMsg.CloudEvent, log)
+
+		// The returned context is discarded: each entry gets its own span and
+		// the batch is delivered under one call.
+		_, span := diag.StartInternalCallbackSpan(ctx, "pubsub/"+psm.Topic, sc, h.tracingSpec)
+		if span != nil {
+			spans[n] = span
+			n++
+		}
+	}
+
+	spans = spans[:n]
+	defer todo.EndSpans(spans)
+
+	start := time.Now()
+	resp, err := h.channels.AppChannel().InvokeMethod(ctx, iReq, "")
+	elapsed := diag.ElapsedSince(start)
+
+	if err != nil {
+		bscData.BulkSubDiag.AddStatusCount(contribpubsub.Retry, int64(len(rawMsgEntries)))
+		bscData.BulkSubDiag.SetElapsed(elapsed)
+
+		todo.PopulateBulkSubscribeResponsesWithError(psm, &bsrr.Entries, err)
+
+		return fmt.Errorf("error from app channel while sending pub/sub event to app: %w", err)
+	}
+
+	defer resp.Close()
+
+	statusCode := int(resp.Status().GetCode())
+
+	for _, span := range spans {
+		m := diag.ConstructSubscriptionSpanAttributes(psm.Topic)
+		diag.AddAttributesToSpan(span, m)
+		diag.UpdateSpanStatusFromHTTPStatus(span, statusCode)
+	}
+
+	if (statusCode >= 200) && (statusCode <= 299) {
+		// Any 2xx is considered a success.
+		var appBulkResponse contribpubsub.AppBulkResponse
+
+		err = json.NewDecoder(resp.RawData()).Decode(&appBulkResponse)
+		if err != nil {
+			bscData.BulkSubDiag.AddStatusCount(contribpubsub.Retry, int64(len(rawMsgEntries)))
+			bscData.BulkSubDiag.SetElapsed(elapsed)
+
+			todo.PopulateBulkSubscribeResponsesWithError(psm, &bsrr.Entries, err)
+
+			return fmt.Errorf("failed unmarshalling app response for bulk subscribe: %w", err)
+		}
+
+		var hasAnyError bool
+
+		for _, response := range appBulkResponse.AppResponses {
+			if msg, ok := attemptMsgs[response.EntryId]; ok {
+				delete(attemptMsgs, response.EntryId)
+
+				switch response.Status {
+				case "":
+					// When statusCode 2xx, Consider empty status field OR not receiving status for an item as retry
+					fallthrough
+				case contribpubsub.Retry:
+					bscData.BulkSubDiag.AddStatusCount(contribpubsub.Retry, 1)
+					todo.AddBulkResponseEntry(&bsrr.Entries, response.EntryId,
+						fmt.Errorf("RETRY required while processing bulk subscribe event for entry id: %v", response.EntryId))
+
+					hasAnyError = true
+				case contribpubsub.Success:
+					bscData.BulkSubDiag.AddStatusCount(contribpubsub.Success, 1)
+					todo.AddBulkResponseEntry(&bsrr.Entries, response.EntryId, nil)
+				case contribpubsub.Drop:
+					bscData.BulkSubDiag.AddStatusCount(contribpubsub.Drop, 1)
+					log.Warnf("DROP status returned from app while processing pub/sub event %v", response.EntryId)
+					todo.AddBulkResponseEntry(&bsrr.Entries, response.EntryId, nil)
+
+					if req.DeadLetterTopic != "" {
+						_ = h.sendToDeadLetter(ctx, bscData.PsName, &contribpubsub.NewMessage{
+							Data:        msg.Entry.Event,
+							Topic:       bscData.Topic,
+							Metadata:    msg.Entry.Metadata,
+							ContentType: &msg.Entry.ContentType,
+						}, req.DeadLetterTopic)
+					}
+				default:
+					// Consider unknown status field as error and retry
+					bscData.BulkSubDiag.AddStatusCount(contribpubsub.Retry, 1)
+					todo.AddBulkResponseEntry(&bsrr.Entries, response.EntryId,
+						fmt.Errorf("unknown status returned from app while processing bulk subscribe event %v: %v", response.EntryId, response.Status))
+
+					hasAnyError = true
+				}
+			} else {
+				log.Warnf("Invalid entry id received from app while processing pub/sub event %v: not in this delivery, or already answered", response.EntryId)
+				continue
+			}
+		}
+
+		for _, item := range rawMsgEntries {
+			if _, ok := attemptMsgs[item.EntryId]; ok {
+				todo.AddBulkResponseEntry(&bsrr.Entries, item.EntryId,
+					fmt.Errorf("response not received, RETRY required while processing bulk subscribe event for entry id: %v", item.EntryId),
+				)
+
+				hasAnyError = true
+				bscData.BulkSubDiag.AddStatusCount(contribpubsub.Retry, 1)
+			}
+		}
+
+		bscData.BulkSubDiag.SetElapsed(elapsed)
+
+		if hasAnyError {
+			return errors.New("few message(s) have failed during bulk subscribe operation")
+		} else {
+			return nil
+		}
+	}
+
+	if statusCode == nethttp.StatusNotFound {
+		// These are errors that are not retriable, for now it is just 404 but more status codes can be added.
+		// When adding/removing an error here, check if that is also applicable to GRPC since there is a mapping between HTTP and GRPC errors:
+		// https://cloud.google.com/apis/design/errors#handling_errors
+		log.Errorf("Non-retriable error returned from app while processing bulk pub/sub event. status code returned: %v", statusCode)
+
+		bscData.BulkSubDiag.AddStatusCount(contribpubsub.Drop, int64(len(rawMsgEntries)))
+		bscData.BulkSubDiag.SetElapsed(elapsed)
+
+		todo.PopulateBulkSubscribeResponsesWithError(psm, &bsrr.Entries, nil)
+
+		return nil
+	}
+
+	// Every error from now on is a retriable error.
+	retriableErrorStr := fmt.Sprintf("Retriable error returned from app while processing bulk pub/sub event, topic: %v. status code returned: %v", psm.Topic, statusCode)
+	retriableError := errors.New(retriableErrorStr)
+	log.Warn(retriableErrorStr)
+
+	bscData.BulkSubDiag.AddStatusCount(contribpubsub.Retry, int64(len(rawMsgEntries)))
+	bscData.BulkSubDiag.SetElapsed(elapsed)
+
+	todo.PopulateBulkSubscribeResponsesWithError(psm, &bsrr.Entries, retriableError)
+
+	return retriableError
+}
+
+// sendBulkToDeadLetter sends every entry of the bulk message to the dead letter
+// topic.
+func (h *http) sendBulkToDeadLetter(ctx context.Context,
+	bulkSubCallData *todo.BulkSubscribeCallData, msg *contribpubsub.BulkMessage, deadLetterTopic string,
+) error {
+	bscData := *bulkSubCallData
+
+	bscData.BulkSubDiag.AddStatusCount(contribpubsub.Drop, int64(len(msg.Entries)))
+
+	req := &contribpubsub.BulkPublishRequest{
+		Entries:    msg.Entries,
+		PubsubName: bscData.PsName,
+		Topic:      deadLetterTopic,
+		Metadata:   msg.Metadata,
+	}
+
+	// Skip the DLQ publish if the parent was explicitly canceled (e.g.
+	// shutdown); detaching the deadline below would otherwise let this block
+	// for up to deadLetterPublishTimeout during shutdown. See the matching
+	// helper in pkg/runtime/subscription/subscription.go for why an inherited
+	// inbound-handler deadline cannot be used for the publish itself.
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return ctx.Err()
+	}
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deadLetterPublishTimeout)
+	defer cancel()
+
+	// Internal dead-letter republish (not an HTTP/gRPC publish API call), so match broker errors on native gRPC status codes.
+	_, err := h.adapter.BulkPublish(pubCtx, req, pubsub.TransportModeGRPC)
+	if err != nil {
+		log.Errorf("error sending message to dead letter, origin topic: %s dead letter topic %s err: %v", msg.Topic, deadLetterTopic, err)
+	}
+
+	return err
+}
+
+func (h *http) sendToDeadLetter(ctx context.Context, name string, msg *contribpubsub.NewMessage, deadLetterTopic string) error {
+	req := &contribpubsub.PublishRequest{
+		Data:        msg.Data,
+		PubsubName:  name,
+		Topic:       deadLetterTopic,
+		Metadata:    msg.Metadata,
+		ContentType: msg.ContentType,
+	}
+
+	// Skip the DLQ publish if the parent was explicitly canceled (e.g.
+	// shutdown); detaching the deadline below would otherwise let this block
+	// for up to deadLetterPublishTimeout during shutdown. See the matching
+	// helper in pkg/runtime/subscription/subscription.go for why an inherited
+	// inbound-handler deadline cannot be used for the publish itself.
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return ctx.Err()
+	}
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deadLetterPublishTimeout)
+	defer cancel()
+
+	// Internal dead-letter republish (not an HTTP/gRPC publish API call), so match broker errors on native gRPC status codes.
+	err := h.adapter.Publish(pubCtx, req, pubsub.TransportModeGRPC)
+	if err != nil {
+		log.Errorf("error sending message to dead letter, origin topic: %s dead letter topic %s err: %v", msg.Topic, deadLetterTopic, err)
+		return err
+	}
+
+	return nil
+}

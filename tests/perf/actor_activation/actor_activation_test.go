@@ -1,9 +1,18 @@
+//go:build perf
 // +build perf
 
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package actor_timer_with_state_perf
 
@@ -11,25 +20,31 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/dapr/dapr/tests/perf"
 	"github.com/dapr/dapr/tests/perf/utils"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 	"github.com/dapr/dapr/tests/runner"
+	"github.com/dapr/dapr/tests/runner/summary"
 	"github.com/stretchr/testify/require"
 )
 
 const (
-	numHealthChecks = 60 // Number of times to check for endpoint health per app.
+	numHealthChecks        = 60 // Number of times to check for endpoint health per app.
+	serviceApplicationName = "perf-actor-activation-service"
+	clientApplicationName  = "perf-actor-activation-client"
 )
 
 var tr *runner.TestRunner
 
 func TestMain(m *testing.M) {
+	utils.SetupLogs("actor_activation")
+
 	testApps := []kube.AppDescription{
 		{
-			AppName:           "testapp",
+			AppName:           serviceApplicationName,
 			DaprEnabled:       true,
 			ImageName:         "perf-actorjava",
 			Replicas:          1,
@@ -44,9 +59,12 @@ func TestMain(m *testing.M) {
 			AppCPURequest:     "0.1",
 			AppMemoryLimit:    "800Mi",
 			AppMemoryRequest:  "2500Mi",
+			Labels: map[string]string{
+				"daprtest": serviceApplicationName,
+			},
 		},
 		{
-			AppName:           "tester",
+			AppName:           clientApplicationName,
 			DaprEnabled:       true,
 			ImageName:         "perf-tester",
 			Replicas:          1,
@@ -61,6 +79,12 @@ func TestMain(m *testing.M) {
 			AppCPURequest:     "0.1",
 			AppMemoryLimit:    "800Mi",
 			AppMemoryRequest:  "2500Mi",
+			Labels: map[string]string{
+				"daprtest": clientApplicationName,
+			},
+			PodAffinityLabels: map[string]string{
+				"daprtest": serviceApplicationName,
+			},
 		},
 	}
 
@@ -69,10 +93,15 @@ func TestMain(m *testing.M) {
 }
 
 func TestActorActivate(t *testing.T) {
-	p := perf.Params()
+	p := perf.Params(
+		perf.WithQPS(500),
+		perf.WithConnections(8),
+		perf.WithDuration("1m"),
+		perf.WithPayload("{}"),
+	)
 
 	// Get the ingress external url of test app
-	testAppURL := tr.Platform.AcquireAppExternalURL("testapp")
+	testAppURL := tr.Platform.AcquireAppExternalURL(serviceApplicationName)
 	require.NotEmpty(t, testAppURL, "test app external URL must not be empty")
 
 	// Check if test app endpoint is available
@@ -81,7 +110,7 @@ func TestActorActivate(t *testing.T) {
 	require.NoError(t, err)
 
 	// Get the ingress external url of tester app
-	testerAppURL := tr.Platform.AcquireAppExternalURL("tester")
+	testerAppURL := tr.Platform.AcquireAppExternalURL(clientApplicationName)
 	require.NotEmpty(t, testerAppURL, "tester app external URL must not be empty")
 
 	// Check if tester app endpoint is available
@@ -101,24 +130,22 @@ func TestActorActivate(t *testing.T) {
 	t.Log("checking err...")
 	require.NoError(t, err)
 	require.NotEmpty(t, daprResp)
+	// fast fail if daprResp starts with error
+	require.False(t, strings.HasPrefix(string(daprResp), "error"))
 
-	appUsage, err := tr.Platform.GetAppUsage("testapp")
+	appUsage, err := tr.Platform.GetAppUsage(serviceApplicationName)
 	require.NoError(t, err)
 
-	sidecarUsage, err := tr.Platform.GetSidecarUsage("testapp")
+	sidecarUsage, err := tr.Platform.GetSidecarUsage(serviceApplicationName)
 	require.NoError(t, err)
 
-	restarts, err := tr.Platform.GetTotalRestarts("testapp")
+	restarts, err := tr.Platform.GetTotalRestarts(serviceApplicationName)
 	require.NoError(t, err)
 
-	testerRestarts, err := tr.Platform.GetTotalRestarts("tester")
+	testerRestarts, err := tr.Platform.GetTotalRestarts(clientApplicationName)
 	require.NoError(t, err)
 
-	t.Logf("dapr test results: %s", string(daprResp))
-	t.Logf("target dapr app consumed %vm CPU and %vMb of Memory", appUsage.CPUm, appUsage.MemoryMb)
-	t.Logf("target dapr sidecar consumed %vm CPU and %vMb of Memory", sidecarUsage.CPUm, sidecarUsage.MemoryMb)
-	t.Logf("target dapr app or sidecar restarted %v times", restarts)
-	t.Logf("tester app or sidecar restarted %v times", testerRestarts)
+	utils.LogPerfTestResourceUsage(appUsage, sidecarUsage, restarts, testerRestarts)
 
 	var daprResult perf.TestResult
 	err = json.Unmarshal(daprResp, &daprResult)
@@ -130,18 +157,20 @@ func TestActorActivate(t *testing.T) {
 		daprValue := daprResult.DurationHistogram.Percentiles[k].Value
 		t.Logf("%s percentile: %sms", v, fmt.Sprintf("%.2f", daprValue*1000))
 	}
+	t.Logf("Actual QPS: %.2f, expected QPS: %d", daprResult.ActualQPS, p.QPS)
 
-	report := perf.NewTestReport(
-		[]perf.TestResult{daprResult},
-		"Actor Activation",
-		sidecarUsage,
-		appUsage)
-	report.SetTotalRestartCount(restarts)
-	err = utils.UploadAzureBlob(report)
-
-	if err != nil {
-		t.Error(err)
-	}
+	summary.ForTest(t).
+		Service(serviceApplicationName).
+		Client(clientApplicationName).
+		CPU(appUsage.CPUm).
+		Memory(appUsage.MemoryMb).
+		SidecarCPU(sidecarUsage.CPUm).
+		SidecarMemory(sidecarUsage.MemoryMb).
+		Restarts(restarts).
+		ActualQPS(daprResult.ActualQPS).
+		Params(p).
+		OutputFortio(daprResult).
+		Flush()
 
 	require.Equal(t, 0, daprResult.RetCodes.Num400)
 	require.Equal(t, 0, daprResult.RetCodes.Num500)
@@ -149,4 +178,8 @@ func TestActorActivate(t *testing.T) {
 	require.True(t, daprResult.ActualQPS > float64(p.QPS)*0.99)
 	require.True(t, daprResult.DurationHistogram.Percentiles[2].Value*1000 < 15)
 	require.True(t, daprResult.DurationHistogram.Percentiles[3].Value*1000 < 35)
+
+	summaryBytes, err := json.Marshal(daprResult)
+	require.NoError(t, err)
+	utils.LogPerfTestSummary(summaryBytes)
 }

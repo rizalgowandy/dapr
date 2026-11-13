@@ -1,7 +1,15 @@
-# ------------------------------------------------------------
-# Copyright (c) Microsoft Corporation and Dapr Contributors.
-# Licensed under the MIT License.
-# ------------------------------------------------------------
+#
+# Copyright 2021 The Dapr Authors
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 # This script finds all release notes from issues in the milestone project.
 
@@ -16,7 +24,6 @@ from github import Github
 
 releaseIssueRegex = "^v(.*) Release Planning$"
 releaseNoteRegex = "^RELEASE NOTE:(.*)$"
-dashboardReleaseVersionRegex = "v([0-9\.]+)-?.*"
 majorReleaseRegex = "^([0-9]+\.[0-9]+)\.[0-9]+.*$"
 milestoneRegex = "https://github.com/dapr/(.+)/milestone/([0-9]+)"
 
@@ -26,7 +33,6 @@ top_repos=[
     'dapr',
     'cli',
     'components-contrib',
-    'dashboard',
     'dotnet-sdk',
     'go-sdk',
     'java-sdk',
@@ -43,7 +49,6 @@ top_repos=[
 subtitles={
     "dapr": "Dapr Runtime",
     "cli": "Dapr CLI",
-    "dashboard": "Dashboard",
     "components-contrib": "Components",
     "java-sdk": "Java SDK",
     "dotnet-sdk": ".NET SDK",
@@ -107,11 +112,6 @@ if os.getenv("GITHUB_ENV"):
         githubEnv.write("REL_BRANCH=release-{}\n".format(
             re.search(majorReleaseRegex, releaseVersion).group(1)))
 
-# get dashboard release version
-releases = sorted([r for r in g.get_repo("dapr/dashboard").get_releases()], key=lambda r: r.created_at, reverse=True)
-dashboardReleaseVersion = re.search(dashboardReleaseVersionRegex, releases[0].tag_name).group(1)
-print("Detected Dapr Dashboard version {}".format(dashboardReleaseVersion))
-
 releaseNotePath="docs/release_notes/v{}.md".format(releaseVersion)
 
 # get all issues previously released to avoid adding issues in previous release candidates.
@@ -157,19 +157,23 @@ for issueOrPR in issuesOrPRs:
         a = [l.login for l in issueOrPR.assignees]
         if len(a) == 0:
             print("Issue is unassigned: {}".format(url))
-        for c in a: 
+        for c in a:
             contributors.add("@" + str(c))
     repo = issueOrPR.repository
-    match = re.search(releaseNoteRegex, issueOrPR.body, re.M)
+    if repo == "docs":
+        # Do not add this to the list of changes (but add to contributors).
+        continue
     hasNote = False
-    if match:
-        note = match.group(1).strip()
-        if note:
-            if note.upper() not in ["NOT APPLICABLE", "N/A"]:
-                for text_substitution in text_substitutions:
-                    note = text_substitution[0].sub(text_substitution[1], note)
-                changes.append((repo, issueOrPR, note, contributors, url))
-            hasNote = True
+    if issueOrPR.body is not None:
+        match = re.search(releaseNoteRegex, issueOrPR.body, re.M)
+        if match:
+            note = match.group(1).strip()
+            if note:
+                if note.upper() not in ["NOT APPLICABLE", "N/A"]:
+                    for text_substitution in text_substitutions:
+                        note = text_substitution[0].sub(text_substitution[1], note)
+                    changes.append((repo, issueOrPR, note, contributors, url))
+                hasNote = True
     if not hasNote:
         # Issue or PR has no release note.
         # Auto-generate a release note as fallback.
@@ -186,9 +190,13 @@ lastSubtitle=""
 breakingChangeLines=[]
 lastBreakingChangeSubtitle=""
 
-# generate changes for relase notes (only issues/pr that have release notes)
+deprecationNoticeLines=[]
+lastDeprecationNoticeSubtitle=""
+
+# generate changes for release notes (only issues/pr that have release notes)
 for change in sorted(changes, key=lambda c: (get_repo_priority(c[0].name), c[0].stargazers_count * -1, c[0].id, c[1].id)):
     breakingChange='breaking-change' in [l.name for l in change[1].labels]
+    deprecationNotice='deprecation' in [l.name for l in change[1].labels]
     subtitle=get_repo_subtitle(change[0].name)
     if lastSubtitle != subtitle:
         lastSubtitle = subtitle
@@ -196,12 +204,18 @@ for change in sorted(changes, key=lambda c: (get_repo_priority(c[0].name), c[0].
     # set issue url
     changeUrl = " [" + str(change[1].number) + "](" + change[4] + ")"
     changeLines.append("- " + change[2] + changeUrl)
-    
+
     if breakingChange:
         if lastBreakingChangeSubtitle != subtitle:
             lastBreakingChangeSubtitle = subtitle
             breakingChangeLines.append("### " + subtitle)
         breakingChangeLines.append("- " + change[2] + changeUrl)
+
+    if deprecationNotice:
+        if lastDeprecationNoticeSubtitle != subtitle:
+            lastDeprecationNoticeSubtitle = subtitle
+            deprecationNoticeLines.append("### " + subtitle)
+        deprecationNoticeLines.append("- " + change[2] + changeUrl)
 
 if len(breakingChangeLines) > 0:
     warnings.append("> **Note: This release contains a few [breaking changes](#breaking-changes).**")
@@ -216,6 +230,9 @@ changesText='\n'.join(changeLines)
 breakingChangesText='None.'
 if len(breakingChangeLines) > 0:
     breakingChangesText='\n'.join(breakingChangeLines)
+deprecationNoticesText='None.'
+if len(deprecationNoticeLines) > 0:
+    deprecationNoticesText='\n'.join(deprecationNoticeLines)
 warningsText=''
 if len(warnings) > 0:
     warningsText='\n\n'.join(warnings)
@@ -223,10 +240,10 @@ if len(warnings) > 0:
 with open(releaseNotePath, 'w') as file:
     file.write(Template(template).safe_substitute(
         dapr_version=releaseVersion,
-        dapr_dashboard_version=dashboardReleaseVersion,
         dapr_changes=changesText,
         dapr_breaking_changes=breakingChangesText,
+        dapr_deprecation_notices=deprecationNoticesText,
         warnings=warningsText,
-        dapr_contributors=", ".join(sorted(list(contributors))),
+        dapr_contributors=", ".join(sorted(list(contributors), key=str.casefold)),
         today=date.today().strftime("%Y-%m-%d")))
 print("Done.")
